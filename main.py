@@ -20,6 +20,8 @@ this script (real environment wins). Variables:
     AUTHOR_INDEX_SIZE   messages tracked for edit attribution, default 2048
     WEBHOOK_ENABLED     re-post deleted messages to a webhook, default false
     WEBHOOK_URL         webhook that receives the deleted messages
+    WEBHOOK_USERS_FILE  default: webhook_users.txt; only these user IDs are
+                        re-posted, and empty means nobody
     LOG_FILE            optional rotating log path (stdout always logs)
     LOG_LEVEL           default INFO
 
@@ -113,6 +115,7 @@ DELETE_WORKERS = max(1, int(os.getenv('DELETE_WORKERS', '2')))
 DELETE_QUEUE_SIZE = max(16, int(os.getenv('DELETE_QUEUE_SIZE', '512')))
 WEBHOOK_ENABLED = _env_bool('WEBHOOK_ENABLED', False)
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', '').strip()
+WEBHOOK_USERS_FILE = _env_path('WEBHOOK_USERS_FILE', BASE_DIR / 'webhook_users.txt')
 LOG_FILE = os.getenv('LOG_FILE')
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
 
@@ -214,13 +217,14 @@ class PendingForward(NamedTuple):
 
 class AntiReportClient(discord.Client):
     def __init__(self, blacklist: Blacklist, whitelist: IdWhitelist,
-                 server_whitelist: IdWhitelist, *,
+                 server_whitelist: IdWhitelist, webhook_users: IdWhitelist, *,
                  blacklist_path: Path | None = None, match_mode: str = 'word',
                  **options) -> None:
         super().__init__(**options)
         self.blacklist = blacklist
         self.whitelist = whitelist
         self.server_whitelist = server_whitelist
+        self.webhook_users = webhook_users
         self._blacklist_path = blacklist_path
         self._match_mode = match_mode
         self._blacklist_mtime = self._stat_blacklist_mtime()
@@ -264,6 +268,9 @@ class AntiReportClient(discord.Client):
                 if self.server_whitelist.reload():
                     log.info('server whitelist reloaded (%d entries)',
                              len(self.server_whitelist.ids))
+                if WEBHOOK_ENABLED and self.webhook_users.reload():
+                    log.info('webhook user list reloaded (%d entries)',
+                             len(self.webhook_users.ids))
                 await self._reload_blacklist()
             except asyncio.CancelledError:
                 raise
@@ -306,6 +313,8 @@ class AntiReportClient(discord.Client):
             log.warning('server whitelist is empty: no servers will be monitored')
         if not self.whitelist.ids:
             log.warning('whitelist is empty: no messages will be checked or deleted')
+        if WEBHOOK_ENABLED and not self.webhook_users.ids:
+            log.warning('webhook user list is empty: no messages will be re-posted')
         log.info('blacklist: %s | match mode: %s',
                  self.blacklist.info(), self.blacklist.match_mode)
 
@@ -329,7 +338,7 @@ class AntiReportClient(discord.Client):
         if term is None:
             term = self._check_extra_text(message)
         if term is not None:
-            forward = self._build_forward(message) if WEBHOOK_ENABLED else None
+            forward = self._build_forward(message) if self._forward_allowed(author_id) else None
             self._enqueue_delete(message.channel.id, message.id, author_id, term, forward)
 
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
@@ -356,10 +365,15 @@ class AntiReportClient(discord.Client):
         if term is not None:
             # The raw edit payload has no author name or avatar; re-post the
             # text under the webhook's own identity.
-            forward = PendingForward(content, None, None) if WEBHOOK_ENABLED else None
+            forward = (PendingForward(content, None, None)
+                       if self._forward_allowed(author_id) else None)
             self._enqueue_delete(payload.channel_id, payload.message_id, author_id, term, forward)
 
     # -- helpers -----------------------------------------------------------
+
+    def _forward_allowed(self, author_id: int) -> bool:
+        """Only opted-in users are re-posted; the toggle gates the whole feature."""
+        return WEBHOOK_ENABLED and author_id in self.webhook_users.ids
 
     def _remember(self, message_id: int, author_id: int) -> None:
         index = self._author_index
@@ -547,11 +561,21 @@ def main() -> None:
     blacklist = Blacklist.load(BLACKLIST_FILE, match_mode=MATCH_MODE)
     whitelist = IdWhitelist(WHITELIST_FILE, 'whitelist')
     server_whitelist = IdWhitelist(SERVER_WHITELIST_FILE, 'server whitelist')
+    webhook_users = IdWhitelist(WEBHOOK_USERS_FILE, 'webhook user list')
     log.info('blacklist loaded from %s: %s', BLACKLIST_FILE.name, blacklist.info())
     if not server_whitelist.ids:
         log.warning('server whitelist is empty: no servers will be monitored')
     if WEBHOOK_ENABLED:
         log.info('webhook re-posting enabled')
+        if not WEBHOOK_USERS_FILE.exists():
+            log.warning('webhook user list not found at %s; no messages will be re-posted',
+                        WEBHOOK_USERS_FILE)
+        elif not webhook_users.ids:
+            log.warning('webhook user list is empty: no messages will be re-posted')
+        unlisted = webhook_users.ids - whitelist.ids
+        if unlisted:
+            log.warning('%d webhook user(s) are not in the user whitelist and will never '
+                        'be forwarded', len(unlisted))
 
     # Memory-lean client for a 1 GB host: no message cache, no member cache,
     # no startup chunking. Guild subscriptions stay on so messages from large
@@ -560,6 +584,7 @@ def main() -> None:
         blacklist,
         whitelist,
         server_whitelist,
+        webhook_users,
         blacklist_path=BLACKLIST_FILE,
         match_mode=MATCH_MODE,
         max_messages=None,

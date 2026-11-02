@@ -65,13 +65,18 @@ A real environment variable (`export DISCORD_TOKEN=...`) overrides `.env`.
    `.env` (`MATCH_MODE`, workers, queue size, logging) are documented in
    `.env.example`.
 
-6. Optional: to re-post every deleted message into a channel, create a webhook
-   in that channel and add it to `.env`:
+6. Optional: to re-post deleted messages into a channel, create a webhook in
+   that channel and add it to `.env`:
 
    ```ini
    WEBHOOK_ENABLED=true
    WEBHOOK_URL=https://discord.com/api/webhooks/123456789012345678/your-token
+   WEBHOOK_USERS_FILE=webhook_users.txt
    ```
+
+   Then list the user IDs whose messages should be re-posted in
+   `webhook_users.txt`, one per line. Only those users are forwarded; an empty
+   list re-posts nothing.
 
 ## Run
 
@@ -142,6 +147,8 @@ sudo systemctl restart antireport
 - `blacklist not found: ...`: check `BLACKLIST_FILE` in `.env`.
 - `server whitelist is empty: no servers will be monitored`: add guild IDs to
   `whitelist_servers.txt`.
+- `webhook user list is empty: no messages will be re-posted`: add user IDs to
+  `webhook_users.txt`.
 - `WEBHOOK_ENABLED is true but WEBHOOK_URL is empty` or
   `WEBHOOK_URL does not look like a Discord webhook URL`: fix `WEBHOOK_URL`.
 - `webhook rejected further re-posts (status 401/403/404)`: the webhook was

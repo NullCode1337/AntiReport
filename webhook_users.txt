@@ -1,0 +1,6 @@
+# User IDs whose deleted messages are re-posted to the webhook, one per line.
+# This is the opt-in list: only users listed here are forwarded.
+#
+# An empty list means nothing is re-posted. Add one ID per line, e.g.:
+#
+# 123456789012345678
