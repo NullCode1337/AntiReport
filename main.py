@@ -11,6 +11,9 @@ this script (real environment wins). Variables:
     DISCORD_TOKEN       user token, required unless token.txt exists
     BLACKLIST_FILE      default: blacklist_words.txt
     WHITELIST_FILE      default: whitelist_users.txt
+    SERVER_WHITELIST_FILE
+                        default: whitelist_servers.txt; only these guilds are
+                        monitored, and empty means none
     MATCH_MODE          word (default) | substring
     DELETE_WORKERS      concurrent delete workers, default 2
     DELETE_QUEUE_SIZE   pending deletes before shedding, default 512
@@ -23,9 +26,10 @@ this script (real environment wins). Variables:
 Relative paths in BLACKLIST_FILE/WHITELIST_FILE resolve against this script's
 directory, not the process working directory.
 
-Whitelist format: one user ID per line, or comma/space separated; '#' starts
-a comment. Both the whitelist and the blacklist are re-read when their mtime
-changes, so terms and users can be updated without a restart.
+Whitelist format: one ID per line, or comma/space separated; '#' starts a
+comment. whitelist_users.txt holds user IDs, whitelist_servers.txt holds guild
+IDs; only listed guilds are monitored. Both files, and the blacklist, are
+re-read when their mtime changes, so entries can be updated without a restart.
 """
 
 from __future__ import annotations
@@ -103,6 +107,7 @@ TOKEN_ENV = 'DISCORD_TOKEN'
 TOKEN_FILE = BASE_DIR / 'token.txt'
 BLACKLIST_FILE = _env_path('BLACKLIST_FILE', BASE_DIR / 'blacklist_words.txt')
 WHITELIST_FILE = _env_path('WHITELIST_FILE', BASE_DIR / 'whitelist_users.txt')
+SERVER_WHITELIST_FILE = _env_path('SERVER_WHITELIST_FILE', BASE_DIR / 'whitelist_servers.txt')
 MATCH_MODE = os.getenv('MATCH_MODE', 'word').strip().lower()
 DELETE_WORKERS = max(1, int(os.getenv('DELETE_WORKERS', '2')))
 DELETE_QUEUE_SIZE = max(16, int(os.getenv('DELETE_QUEUE_SIZE', '512')))
@@ -150,11 +155,12 @@ def setup_logging() -> None:
     logging.getLogger('discord.http').setLevel(max(level, logging.WARNING))
 
 
-class Whitelist:
-    """Set of user IDs backed by a file, reloaded when the file changes."""
+class IdWhitelist:
+    """Set of IDs backed by a file, reloaded when the file changes."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, label: str = 'whitelist') -> None:
         self.path = path
+        self.label = label
         self.ids: frozenset[int] = frozenset()
         self._mtime: int | None = None
         self.reload(force=True)
@@ -172,7 +178,8 @@ class Whitelist:
         self._mtime = mtime
         if mtime is None:
             if self.ids:
-                log.warning('whitelist file %s disappeared, keeping previous entries', self.path)
+                log.warning('%s file %s disappeared, keeping previous entries',
+                            self.label, self.path)
             return False
 
         ids: set[int] = set()
@@ -182,18 +189,18 @@ class Whitelist:
                     line = line.split('#', 1)[0]
                     for token in line.replace(',', ' ').split():
                         if not token.isdigit():
-                            log.warning('whitelist %s:%d: ignoring non-numeric entry %r',
-                                        self.path.name, lineno, token)
+                            log.warning('%s %s:%d: ignoring non-numeric entry %r',
+                                        self.label, self.path.name, lineno, token)
                             continue
                         ids.add(int(token))
         except OSError as exc:
-            log.error('cannot read whitelist %s: %s', self.path, exc)
+            log.error('cannot read %s %s: %s', self.label, self.path, exc)
             return False
 
         changed = ids != set(self.ids)
         self.ids = frozenset(ids)
         if changed:
-            log.info('whitelist loaded: %d user(s)', len(ids))
+            log.info('%s loaded: %d entries', self.label, len(ids))
         return changed
 
 
@@ -206,12 +213,14 @@ class PendingForward(NamedTuple):
 
 
 class AntiReportClient(discord.Client):
-    def __init__(self, blacklist: Blacklist, whitelist: Whitelist, *,
+    def __init__(self, blacklist: Blacklist, whitelist: IdWhitelist,
+                 server_whitelist: IdWhitelist, *,
                  blacklist_path: Path | None = None, match_mode: str = 'word',
                  **options) -> None:
         super().__init__(**options)
         self.blacklist = blacklist
         self.whitelist = whitelist
+        self.server_whitelist = server_whitelist
         self._blacklist_path = blacklist_path
         self._match_mode = match_mode
         self._blacklist_mtime = self._stat_blacklist_mtime()
@@ -252,6 +261,9 @@ class AntiReportClient(discord.Client):
             try:
                 if self.whitelist.reload():
                     log.info('whitelist reloaded (%d entries)', len(self.whitelist.ids))
+                if self.server_whitelist.reload():
+                    log.info('server whitelist reloaded (%d entries)',
+                             len(self.server_whitelist.ids))
                 await self._reload_blacklist()
             except asyncio.CancelledError:
                 raise
@@ -290,6 +302,8 @@ class AntiReportClient(discord.Client):
     async def on_ready(self) -> None:
         log.info('logged in as %s (%s), %d guild(s)',
                  self.user, self.user.id, len(self.guilds))
+        if not self.server_whitelist.ids:
+            log.warning('server whitelist is empty: no servers will be monitored')
         if not self.whitelist.ids:
             log.warning('whitelist is empty: no messages will be checked or deleted')
         log.info('blacklist: %s | match mode: %s',
@@ -299,6 +313,8 @@ class AntiReportClient(discord.Client):
 
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is None or message.author.id == self.user.id:
+            return
+        if message.guild.id not in self.server_whitelist.ids:
             return
 
         author_id = message.author.id
@@ -320,6 +336,12 @@ class AntiReportClient(discord.Client):
         data = payload.data
         guild_id = data.get('guild_id')
         if guild_id is None:
+            return
+        try:
+            guild_id = int(guild_id)
+        except (TypeError, ValueError):
+            return
+        if guild_id not in self.server_whitelist.ids:
             return
 
         author_id = self._author_index.get(payload.message_id)
@@ -518,10 +540,16 @@ def main() -> None:
         raise SystemExit(f'blacklist not found: {BLACKLIST_FILE}')
     if not WHITELIST_FILE.exists():
         log.warning('whitelist not found at %s; nothing will be checked', WHITELIST_FILE)
+    if not SERVER_WHITELIST_FILE.exists():
+        log.warning('server whitelist not found at %s; no servers will be monitored',
+                    SERVER_WHITELIST_FILE)
 
     blacklist = Blacklist.load(BLACKLIST_FILE, match_mode=MATCH_MODE)
-    whitelist = Whitelist(WHITELIST_FILE)
+    whitelist = IdWhitelist(WHITELIST_FILE, 'whitelist')
+    server_whitelist = IdWhitelist(SERVER_WHITELIST_FILE, 'server whitelist')
     log.info('blacklist loaded from %s: %s', BLACKLIST_FILE.name, blacklist.info())
+    if not server_whitelist.ids:
+        log.warning('server whitelist is empty: no servers will be monitored')
     if WEBHOOK_ENABLED:
         log.info('webhook re-posting enabled')
 
@@ -531,6 +559,7 @@ def main() -> None:
     client = AntiReportClient(
         blacklist,
         whitelist,
+        server_whitelist,
         blacklist_path=BLACKLIST_FILE,
         match_mode=MATCH_MODE,
         max_messages=None,

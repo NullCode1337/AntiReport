@@ -44,19 +44,28 @@ DISCORD_TOKEN=your_token_here
 Alternatively, leave `DISCORD_TOKEN` empty and write the token to `token.txt`.
 A real environment variable (`export DISCORD_TOKEN=...`) overrides `.env`.
 
-3. Add the user IDs whose messages should be checked to `whitelist_users.txt`,
-   one per line:
+3. List the servers (guilds) to monitor in `whitelist_servers.txt`, one ID per
+   line. Messages from any other server are ignored; an empty list monitors
+   nothing.
 
 ```text
 123456789012345678
 234567890123456789
 ```
 
-4. Edit `blacklist_words.txt` if needed, one term per line. Other settings in
+4. Add the user IDs whose messages should be checked to `whitelist_users.txt`,
+   one per line:
+
+```text
+345678901234567890
+456789012345678901
+```
+
+5. Edit `blacklist_words.txt` if needed, one term per line. Other settings in
    `.env` (`MATCH_MODE`, workers, queue size, logging) are documented in
    `.env.example`.
 
-5. Optional: to re-post every deleted message into a channel, create a webhook
+6. Optional: to re-post every deleted message into a channel, create a webhook
    in that channel and add it to `.env`:
 
    ```ini
@@ -79,8 +88,8 @@ logged in as <name> (<id>), <n> guild(s)
 
 Stop with `Ctrl+C`.
 
-The whitelist and blacklist files are re-read automatically when they change;
-no restart is needed after editing them.
+The whitelist, server whitelist, and blacklist files are re-read automatically
+when they change; no restart is needed after editing them.
 
 ## Run as a service (systemd)
 
@@ -131,6 +140,8 @@ sudo systemctl restart antireport
 - `missing Manage Messages in channel <id>; skipping it`: the account cannot
   delete in that channel; grant the permission or remove the channel from use.
 - `blacklist not found: ...`: check `BLACKLIST_FILE` in `.env`.
+- `server whitelist is empty: no servers will be monitored`: add guild IDs to
+  `whitelist_servers.txt`.
 - `WEBHOOK_ENABLED is true but WEBHOOK_URL is empty` or
   `WEBHOOK_URL does not look like a Discord webhook URL`: fix `WEBHOOK_URL`.
 - `webhook rejected further re-posts (status 401/403/404)`: the webhook was

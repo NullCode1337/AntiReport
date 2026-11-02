@@ -1,0 +1,6 @@
+# Server (guild) IDs to monitor, one per line. Commas and spaces also work.
+# Messages from any server not listed here are ignored.
+#
+# An empty list means no servers are monitored. Add one ID per line, e.g.:
+#
+# 123456789012345678
