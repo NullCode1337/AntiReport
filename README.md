@@ -2,6 +2,7 @@
 
 Deletes blacklisted messages from whitelisted users on a Discord user account
 (`discord.py-self`).
+Initial list template was taken from [here](https://github.com/now4real/forbidden-words)
 
 ## Requirements
 
