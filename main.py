@@ -320,6 +320,7 @@ class PendingForward(NamedTuple):
     author_name: str | None
     avatar_url: str | None
     attachments: tuple[object, ...] = ()
+    reply_user_id: int | None = None
 
 
 def _is_image_attachment(attachment: object) -> bool:
@@ -340,6 +341,40 @@ def _safe_upload_name(name: object, fallback: str = 'image') -> str:
     text = ''.join(ch for ch in text if ch.isprintable() and ch != '"')
     text = text.strip() or fallback
     return text[:100]
+
+
+def _raw_reply_target(data: dict) -> int | None:
+    """Return the replied-to author's ID from a raw MESSAGE_UPDATE payload."""
+    reference = data.get('message_reference')
+    if not isinstance(reference, dict):
+        return None
+    if reference.get('type', 0) != 0:
+        return None
+    resolved = data.get('referenced_message')
+    author = resolved.get('author') if isinstance(resolved, dict) else None
+    user_id = author.get('id') if isinstance(author, dict) else None
+    try:
+        return int(user_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reply_target(message: discord.Message) -> int | None:
+    """Return the replied-to author's ID, if this message is a reply.
+
+    A forwarded message also carries a message_reference, so only type
+    "reply" counts. When Discord did not resolve the referenced message the
+    author is simply not recoverable from here and the reply prefix is
+    skipped.
+    """
+    reference = getattr(message, 'reference', None)
+    if reference is None:
+        return None
+    if getattr(reference, 'type', discord.MessageReferenceType.reply) != discord.MessageReferenceType.reply:
+        return None
+    resolved = getattr(reference, 'resolved', None)
+    user_id = getattr(getattr(resolved, 'author', None), 'id', None)
+    return user_id if isinstance(user_id, int) else None
 
 
 def _close_upload(file: discord.File) -> None:
@@ -484,7 +519,8 @@ class AntiReportClient(discord.Client):
                 # text under the webhook's own identity. Attachments are rebuilt
                 # from the payload so images survive an edit-triggered delete.
                 forward = PendingForward(content, None, None,
-                                         self._raw_images(data.get('attachments')))
+                                         self._raw_images(data.get('attachments')),
+                                         _raw_reply_target(data))
             self._enqueue_delete(payload.channel_id, payload.message_id, author_id, term, forward)
 
     # -- helpers -----------------------------------------------------------
@@ -552,7 +588,8 @@ class AntiReportClient(discord.Client):
 
         return PendingForward(content=content[:4096] or '[no text content]',
                               author_name=name, avatar_url=avatar,
-                              attachments=self._forward_images(message))
+                              attachments=self._forward_images(message),
+                              reply_user_id=_reply_target(message))
 
     def _forward_images(self, message: discord.Message) -> tuple[object, ...]:
         """Pick image attachments to re-post, bounded by the configured caps."""
@@ -661,7 +698,14 @@ class AntiReportClient(discord.Client):
             self._webhook = webhook
 
         content = item.content or '[no text content]'
+        if item.reply_user_id is not None:
+            content = f'<@{item.reply_user_id}> {content}'
         payload: dict = {'allowed_mentions': discord.AllowedMentions.none()}
+        if item.reply_user_id is not None:
+            # Nothing else may ping, but the mention must render as a user tag.
+            payload['allowed_mentions'] = discord.AllowedMentions(
+                everyone=False, roles=False, users=[discord.Object(id=item.reply_user_id)],
+                replied_user=False)
         if item.author_name:
             payload['username'] = item.author_name
         if item.avatar_url:
