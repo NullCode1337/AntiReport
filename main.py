@@ -1,7 +1,7 @@
 """Discord selfbot that deletes blacklisted messages from whitelisted users.
 
 Runs on a user account (discord.py-self). Every guild message is checked
-against whitelist_users.txt; if the author is whitelisted, the message text
+against the whitelist; if the author is whitelisted, the message text
 (plus embed text and attachment filenames) is scanned with the Aho-Corasick
 matcher from blacklist.py and the message is deleted on a hit.
 
@@ -10,36 +10,48 @@ this script (real environment wins). Variables:
 
     DISCORD_TOKEN       user token, required unless token.txt exists
     BLACKLIST_FILE      default: blacklist_words.txt
-    WHITELIST_FILE      default: whitelist_users.txt
-    SERVER_WHITELIST_FILE
-                        default: whitelist_servers.txt; only these guilds are
-                        monitored, and empty means none
+    WHITELIST_FILE      default: whitelist.json; users (with optional webhook
+                        opt-in per entry) and servers
     MATCH_MODE          word (default) | substring
     DELETE_WORKERS      concurrent delete workers, default 2
     DELETE_QUEUE_SIZE   pending deletes before shedding, default 512
     AUTHOR_INDEX_SIZE   messages tracked for edit attribution, default 2048
     WEBHOOK_ENABLED     re-post deleted messages to a webhook, default false
     WEBHOOK_URL         webhook that receives the deleted messages
-    WEBHOOK_USERS_FILE  default: webhook_users.txt; only these user IDs are
-                        re-posted, and empty means nobody
+    WEBHOOK_MAX_IMAGES  image attachments re-posted per message, default 4
+    WEBHOOK_MAX_IMAGE_MB per-image size cap for re-posting, default 8
     LOG_FILE            optional rotating log path (stdout always logs)
     LOG_LEVEL           default INFO
 
 Relative paths in BLACKLIST_FILE/WHITELIST_FILE resolve against this script's
 directory, not the process working directory.
 
-Whitelist format: one ID per line, or comma/space separated; '#' starts a
-comment. whitelist_users.txt holds user IDs, whitelist_servers.txt holds guild
-IDs; only listed guilds are monitored. Both files, and the blacklist, are
-re-read when their mtime changes, so entries can be updated without a restart.
+Whitelist format (whitelist.json): a JSON object with two arrays —
+
+    {
+      "users": [
+        123456789012345678,
+        {"id": 234567890123456789, "webhook": true}
+      ],
+      "servers": [345678901234567890]
+    }
+
+Only listed guilds are monitored, and only listed users are checked. A user
+entry is either a bare numeric ID or an object with "id" and an optional
+"webhook" flag (default false); "webhook": true re-posts that user's deleted
+messages to WEBHOOK_URL. The whitelist and the blacklist are re-read when
+their mtime changes, so entries can be updated without a restart.
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
+import io
+import json
 import logging
 import os
+import random
 import re
 import signal
 import sys
@@ -108,14 +120,18 @@ _load_env_file(BASE_DIR / '.env')
 TOKEN_ENV = 'DISCORD_TOKEN'
 TOKEN_FILE = BASE_DIR / 'token.txt'
 BLACKLIST_FILE = _env_path('BLACKLIST_FILE', BASE_DIR / 'blacklist_words.txt')
-WHITELIST_FILE = _env_path('WHITELIST_FILE', BASE_DIR / 'whitelist_users.txt')
-SERVER_WHITELIST_FILE = _env_path('SERVER_WHITELIST_FILE', BASE_DIR / 'whitelist_servers.txt')
+WHITELIST_FILE = _env_path('WHITELIST_FILE', BASE_DIR / 'whitelist.json')
 MATCH_MODE = os.getenv('MATCH_MODE', 'word').strip().lower()
 DELETE_WORKERS = max(1, int(os.getenv('DELETE_WORKERS', '2')))
 DELETE_QUEUE_SIZE = max(16, int(os.getenv('DELETE_QUEUE_SIZE', '512')))
 WEBHOOK_ENABLED = _env_bool('WEBHOOK_ENABLED', False)
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', '').strip()
-WEBHOOK_USERS_FILE = _env_path('WEBHOOK_USERS_FILE', BASE_DIR / 'webhook_users.txt')
+# Image attachments are downloaded into memory and re-uploaded as
+# multipart/form-data.
+WEBHOOK_MAX_IMAGES = max(0, int(os.getenv('WEBHOOK_MAX_IMAGES', '4')))
+WEBHOOK_MAX_IMAGE_BYTES = max(
+    0, int(float(os.getenv('WEBHOOK_MAX_IMAGE_MB', '8')) * 1024 * 1024))
+IMAGE_EXTENSIONS = frozenset({'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.avif'})
 LOG_FILE = os.getenv('LOG_FILE')
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
 
@@ -130,6 +146,11 @@ FORWARD_QUEUE_SIZE = 256
 # MESSAGE_UPDATE payloads do not carry the author, so an edit can only be
 # attributed if the original message was seen while it was still recent.
 AUTHOR_INDEX_SIZE = max(256, int(os.getenv('AUTHOR_INDEX_SIZE', '2048')))
+
+# A hit is acted on after a short random pause so deletion and re-posting do
+# not happen the instant the message is read.
+ACTION_DELAY_MIN = 0.5
+ACTION_DELAY_MAX = 1.0
 
 log = logging.getLogger('antireport')
 
@@ -158,13 +179,99 @@ def setup_logging() -> None:
     logging.getLogger('discord.http').setLevel(max(level, logging.WARNING))
 
 
-class IdWhitelist:
-    """Set of IDs backed by a file, reloaded when the file changes."""
+def _coerce_id(entry: object) -> int | None:
+    """Return an ID from an int or a digit-only string; None for anything else."""
+    if isinstance(entry, bool):
+        return None
+    if isinstance(entry, int):
+        return entry
+    if isinstance(entry, str):
+        text = entry.strip()
+        if text.isdigit():
+            return int(text)
+    return None
 
-    def __init__(self, path: Path, label: str = 'whitelist') -> None:
+
+def _id_set(value: object, label: str, path: Path) -> frozenset[int]:
+    """Parse a JSON array of numeric IDs; non-numbers are skipped with a warning."""
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        log.warning('whitelist %s: %r must be an array, ignoring it', path.name, label)
+        return frozenset()
+    ids: set[int] = set()
+    for entry in value:
+        if isinstance(entry, bool):
+            log.warning('whitelist %s: ignoring boolean %s entry', path.name, label)
+            continue
+        entry_id = _coerce_id(entry)
+        if entry_id is None:
+            log.warning('whitelist %s: ignoring non-numeric %s entry %r',
+                        path.name, label, entry)
+        else:
+            ids.add(entry_id)
+    return frozenset(ids)
+
+
+def _user_sets(value: object, path: Path) -> tuple[frozenset[int], frozenset[int]]:
+    """Parse the users array into (users, webhook_users).
+
+    An entry is either a bare ID or an object ``{"id": <id>, "webhook": <bool>}``
+    where "webhook" defaults to false. The opt-in set is derived from the user
+    entries, so each ID appears once.
+    """
+    if value is None:
+        return frozenset(), frozenset()
+    if not isinstance(value, list):
+        log.warning('whitelist %s: %r must be an array, ignoring it', path.name, 'users')
+        return frozenset(), frozenset()
+
+    users: set[int] = set()
+    webhook_users: set[int] = set()
+    for entry in value:
+        if isinstance(entry, dict):
+            if 'id' not in entry:
+                log.warning('whitelist %s: ignoring user object without "id": %r',
+                            path.name, entry)
+                continue
+            user_id = _coerce_id(entry['id'])
+            if user_id is None:
+                log.warning('whitelist %s: ignoring user with non-numeric id %r',
+                            path.name, entry['id'])
+                continue
+            flag = entry.get('webhook', False)
+            if not isinstance(flag, bool):
+                log.warning('whitelist %s: user %s: "webhook" must be true or false, '
+                            'ignoring the entry', path.name, user_id)
+                continue
+            users.add(user_id)
+            if flag:
+                webhook_users.add(user_id)
+            continue
+
+        if isinstance(entry, bool):
+            log.warning('whitelist %s: ignoring boolean users entry', path.name)
+            continue
+        user_id = _coerce_id(entry)
+        if user_id is None:
+            log.warning('whitelist %s: ignoring non-numeric users entry %r',
+                        path.name, entry)
+            continue
+        users.add(user_id)
+
+    return frozenset(users), frozenset(webhook_users)
+
+
+class Whitelists:
+    """Users, servers, and webhook opt-ins from one JSON file, hot-reloaded."""
+
+    __slots__ = ('path', 'users', 'servers', 'webhook_users', '_mtime')
+
+    def __init__(self, path: Path) -> None:
         self.path = path
-        self.label = label
-        self.ids: frozenset[int] = frozenset()
+        self.users: frozenset[int] = frozenset()
+        self.servers: frozenset[int] = frozenset()
+        self.webhook_users: frozenset[int] = frozenset()
         self._mtime: int | None = None
         self.reload(force=True)
 
@@ -180,30 +287,36 @@ class IdWhitelist:
             return False
         self._mtime = mtime
         if mtime is None:
-            if self.ids:
-                log.warning('%s file %s disappeared, keeping previous entries',
-                            self.label, self.path)
+            if self.users or self.servers or self.webhook_users:
+                log.warning('whitelist file %s disappeared, keeping previous entries',
+                            self.path)
             return False
 
-        ids: set[int] = set()
         try:
-            with self.path.open('r', encoding='utf-8', errors='replace') as handle:
-                for lineno, line in enumerate(handle, 1):
-                    line = line.split('#', 1)[0]
-                    for token in line.replace(',', ' ').split():
-                        if not token.isdigit():
-                            log.warning('%s %s:%d: ignoring non-numeric entry %r',
-                                        self.label, self.path.name, lineno, token)
-                            continue
-                        ids.add(int(token))
-        except OSError as exc:
-            log.error('cannot read %s %s: %s', self.label, self.path, exc)
+            with self.path.open('r', encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as exc:
+            # ValueError covers a half-written or malformed JSON file.
+            log.error('cannot read whitelist %s: %s', self.path, exc)
             return False
 
-        changed = ids != set(self.ids)
-        self.ids = frozenset(ids)
+        if not isinstance(data, dict):
+            log.error('whitelist %s: top level must be a JSON object', self.path)
+            return False
+
+        if 'webhook_users' in data:
+            log.warning('whitelist %s: "webhook_users" is ignored; set "webhook": true on '
+                        'the user entries instead', self.path)
+
+        users, webhook_users = _user_sets(data.get('users'), self.path)
+        servers = _id_set(data.get('servers'), 'servers', self.path)
+
+        changed = (users, servers, webhook_users) != (
+            self.users, self.servers, self.webhook_users)
+        self.users, self.servers, self.webhook_users = users, servers, webhook_users
         if changed:
-            log.info('%s loaded: %d entries', self.label, len(ids))
+            log.info('whitelist loaded: %d user(s), %d server(s), %d webhook user(s)',
+                     len(users), len(servers), len(webhook_users))
         return changed
 
 
@@ -213,18 +326,56 @@ class PendingForward(NamedTuple):
     content: str
     author_name: str | None
     avatar_url: str | None
+    attachments: tuple[object, ...] = ()
+
+
+def _is_image_attachment(attachment: object) -> bool:
+    """True when the attachment advertises an image type or image extension."""
+    content_type = getattr(attachment, 'content_type', None)
+    if isinstance(content_type, str) and content_type.lower().startswith('image/'):
+        return True
+    name = getattr(attachment, 'filename', None)
+    if not isinstance(name, str):
+        return False
+    return os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS
+
+
+def _safe_upload_name(name: object, fallback: str = 'image') -> str:
+    """Strip directories and header-hostile characters from an upload name."""
+    text = name if isinstance(name, str) else ''
+    text = text.replace('\\', '/').rsplit('/', 1)[-1]
+    text = ''.join(ch for ch in text if ch.isprintable() and ch != '"')
+    text = text.strip() or fallback
+    return text[:100]
+
+
+def _close_upload(file: discord.File) -> None:
+    """Release the in-memory buffer behind an upload file.
+
+    discord.File stubs the wrapped buffer's close() and File.close() only
+    restores that stub for a caller-owned BytesIO, so close the buffer itself
+    to free the bytes.
+    """
+    try:
+        file.close()
+    except Exception:
+        pass
+    fp = getattr(file, 'fp', None)
+    close = getattr(fp, 'close', None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            pass
 
 
 class AntiReportClient(discord.Client):
-    def __init__(self, blacklist: Blacklist, whitelist: IdWhitelist,
-                 server_whitelist: IdWhitelist, webhook_users: IdWhitelist, *,
+    def __init__(self, blacklist: Blacklist, whitelists: Whitelists, *,
                  blacklist_path: Path | None = None, match_mode: str = 'word',
                  **options) -> None:
         super().__init__(**options)
         self.blacklist = blacklist
-        self.whitelist = whitelist
-        self.server_whitelist = server_whitelist
-        self.webhook_users = webhook_users
+        self.whitelists = whitelists
         self._blacklist_path = blacklist_path
         self._match_mode = match_mode
         self._blacklist_mtime = self._stat_blacklist_mtime()
@@ -263,14 +414,7 @@ class AntiReportClient(discord.Client):
         while not self.is_closed():
             await asyncio.sleep(30)
             try:
-                if self.whitelist.reload():
-                    log.info('whitelist reloaded (%d entries)', len(self.whitelist.ids))
-                if self.server_whitelist.reload():
-                    log.info('server whitelist reloaded (%d entries)',
-                             len(self.server_whitelist.ids))
-                if WEBHOOK_ENABLED and self.webhook_users.reload():
-                    log.info('webhook user list reloaded (%d entries)',
-                             len(self.webhook_users.ids))
+                self.whitelists.reload()
                 await self._reload_blacklist()
             except asyncio.CancelledError:
                 raise
@@ -309,12 +453,12 @@ class AntiReportClient(discord.Client):
     async def on_ready(self) -> None:
         log.info('logged in as %s (%s), %d guild(s)',
                  self.user, self.user.id, len(self.guilds))
-        if not self.server_whitelist.ids:
+        if not self.whitelists.servers:
             log.warning('server whitelist is empty: no servers will be monitored')
-        if not self.whitelist.ids:
+        if not self.whitelists.users:
             log.warning('whitelist is empty: no messages will be checked or deleted')
-        if WEBHOOK_ENABLED and not self.webhook_users.ids:
-            log.warning('webhook user list is empty: no messages will be re-posted')
+        if WEBHOOK_ENABLED and not self.whitelists.webhook_users:
+            log.warning('no users have "webhook": true, so nothing will be re-posted')
         log.info('blacklist: %s | match mode: %s',
                  self.blacklist.info(), self.blacklist.match_mode)
 
@@ -323,11 +467,11 @@ class AntiReportClient(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is None or message.author.id == self.user.id:
             return
-        if message.guild.id not in self.server_whitelist.ids:
+        if message.guild.id not in self.whitelists.servers:
             return
 
         author_id = message.author.id
-        if author_id not in self.whitelist.ids:
+        if author_id not in self.whitelists.users:
             return
 
         # Only whitelisted authors need to be indexed: the index exists so
@@ -350,11 +494,11 @@ class AntiReportClient(discord.Client):
             guild_id = int(guild_id)
         except (TypeError, ValueError):
             return
-        if guild_id not in self.server_whitelist.ids:
+        if guild_id not in self.whitelists.servers:
             return
 
         author_id = self._author_index.get(payload.message_id)
-        if author_id is None or author_id not in self.whitelist.ids:
+        if author_id is None or author_id not in self.whitelists.users:
             return
 
         content = data.get('content')
@@ -363,17 +507,20 @@ class AntiReportClient(discord.Client):
 
         term = self.blacklist.check(content)
         if term is not None:
-            # The raw edit payload has no author name or avatar; re-post the
-            # text under the webhook's own identity.
-            forward = (PendingForward(content, None, None)
-                       if self._forward_allowed(author_id) else None)
+            forward = None
+            if self._forward_allowed(author_id):
+                # The raw edit payload has no author name or avatar; re-post the
+                # text under the webhook's own identity. Attachments are rebuilt
+                # from the payload so images survive an edit-triggered delete.
+                forward = PendingForward(content, None, None,
+                                         self._raw_images(data.get('attachments')))
             self._enqueue_delete(payload.channel_id, payload.message_id, author_id, term, forward)
 
     # -- helpers -----------------------------------------------------------
 
     def _forward_allowed(self, author_id: int) -> bool:
         """Only opted-in users are re-posted; the toggle gates the whole feature."""
-        return WEBHOOK_ENABLED and author_id in self.webhook_users.ids
+        return WEBHOOK_ENABLED and author_id in self.whitelists.webhook_users
 
     def _remember(self, message_id: int, author_id: int) -> None:
         index = self._author_index
@@ -431,7 +578,48 @@ class AntiReportClient(discord.Client):
             avatar = None
 
         return PendingForward(content=content[:4096] or '[no text content]',
-                              author_name=name, avatar_url=avatar)
+                              author_name=name, avatar_url=avatar,
+                              attachments=self._forward_images(message))
+
+    def _forward_images(self, message: discord.Message) -> tuple[object, ...]:
+        """Pick image attachments to re-post, bounded by the configured caps."""
+        return self._select_images(message.attachments)
+
+    def _raw_images(self, raw: object) -> tuple[object, ...]:
+        """Rebuild attachments from a raw MESSAGE_UPDATE payload.
+
+        Attachment.read() only needs the connection's HTTP client, so the
+        library class works from the raw dicts without a cached Message.
+        """
+        if not isinstance(raw, list) or not raw:
+            return ()
+        rebuilt: list[object] = []
+        for data in raw:
+            if not isinstance(data, dict):
+                continue
+            try:
+                rebuilt.append(discord.Attachment(data=data, state=self._connection))
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                log.debug('skipping malformed attachment in edit payload: %s', exc)
+        return self._select_images(rebuilt)
+
+    def _select_images(self, attachments) -> tuple[object, ...]:
+        if WEBHOOK_MAX_IMAGES <= 0 or WEBHOOK_MAX_IMAGE_BYTES <= 0:
+            return ()
+        selected: list[object] = []
+        for attachment in attachments:
+            if len(selected) >= WEBHOOK_MAX_IMAGES:
+                break
+            if not _is_image_attachment(attachment):
+                continue
+            size = getattr(attachment, 'size', 0) or 0
+            if isinstance(size, int) and size > WEBHOOK_MAX_IMAGE_BYTES:
+                log.warning('not re-posting image %r: %d bytes is over the %d-byte limit',
+                            getattr(attachment, 'filename', '?'), size,
+                            WEBHOOK_MAX_IMAGE_BYTES)
+                continue
+            selected.append(attachment)
+        return tuple(selected)
 
     def _enqueue_delete(self, channel_id: int, message_id: int, author_id: int, term: str,
                         forward: PendingForward | None = None) -> None:
@@ -449,6 +637,7 @@ class AntiReportClient(discord.Client):
             channel_id, message_id, author_id, term, forward = await self._delete_queue.get()
             deleted = False
             try:
+                await asyncio.sleep(random.uniform(ACTION_DELAY_MIN, ACTION_DELAY_MAX))
                 await self.http.delete_message(channel_id, message_id)
                 deleted = True
                 log.info('deleted %s in channel %s from %s (term=%r)',
@@ -480,6 +669,7 @@ class AntiReportClient(discord.Client):
         while True:
             item = await self._forward_queue.get()
             try:
+                await asyncio.sleep(random.uniform(ACTION_DELAY_MIN, ACTION_DELAY_MAX))
                 await self._send_webhook(item)
             finally:
                 self._forward_queue.task_done()
@@ -511,9 +701,17 @@ class AntiReportClient(discord.Client):
             payload['content'] = content[:1999] + '…'
             payload['embeds'] = [discord.Embed(description=content[:4096])]
 
+        files: list[discord.File] = []
+        for attachment in item.attachments:
+            file = await self._download_image(attachment)
+            if file is not None:
+                files.append(file)
+        if files:
+            payload['files'] = files
+
         try:
             await webhook.send(**payload)
-            log.info('re-posted a deleted message to the webhook')
+            log.info('re-posted a deleted message to the webhook (%d image(s))', len(files))
         except discord.HTTPException as exc:
             status = getattr(exc, 'status', None)
             log.warning('webhook re-post failed (%s): %s', status, exc)
@@ -522,6 +720,36 @@ class AntiReportClient(discord.Client):
                 log.error('webhook rejected further re-posts (status %s)', status)
         except Exception:
             log.exception('webhook re-post failed')
+        finally:
+            for file in files:
+                _close_upload(file)
+
+    async def _download_image(self, attachment: object) -> discord.File | None:
+        """Fetch one image into memory for a multipart upload; None on skip/failure."""
+        read = getattr(attachment, 'read', None)
+        if read is None:
+            return None
+        name = getattr(attachment, 'filename', 'image')
+        size = getattr(attachment, 'size', 0) or 0
+        if isinstance(size, int) and size > WEBHOOK_MAX_IMAGE_BYTES:
+            log.warning('not re-posting image %r: %d bytes is over the %d-byte limit',
+                        name, size, WEBHOOK_MAX_IMAGE_BYTES)
+            return None
+        try:
+            # proxy_url survives message deletion more often than the CDN URL.
+            data = await read(use_cached=True)
+        except (discord.HTTPException, OSError) as exc:
+            log.warning('cannot download image %r for the webhook: %s', name, exc)
+            return None
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            log.warning('image %r returned no data; sending the message without it', name)
+            return None
+        if len(data) > WEBHOOK_MAX_IMAGE_BYTES:
+            log.warning('not re-posting image %r: %d bytes is over the %d-byte limit',
+                        name, len(data), WEBHOOK_MAX_IMAGE_BYTES)
+            return None
+        # BytesIO keeps the upload in memory; nothing is written to disk.
+        return discord.File(io.BytesIO(bytes(data)), filename=_safe_upload_name(name))
 
     async def close(self) -> None:
         for worker in self._workers:
@@ -553,38 +781,27 @@ def main() -> None:
     if not BLACKLIST_FILE.exists():
         raise SystemExit(f'blacklist not found: {BLACKLIST_FILE}')
     if not WHITELIST_FILE.exists():
-        log.warning('whitelist not found at %s; nothing will be checked', WHITELIST_FILE)
-    if not SERVER_WHITELIST_FILE.exists():
-        log.warning('server whitelist not found at %s; no servers will be monitored',
-                    SERVER_WHITELIST_FILE)
+        log.warning('whitelist file not found at %s; no servers or users are configured',
+                    WHITELIST_FILE)
 
     blacklist = Blacklist.load(BLACKLIST_FILE, match_mode=MATCH_MODE)
-    whitelist = IdWhitelist(WHITELIST_FILE, 'whitelist')
-    server_whitelist = IdWhitelist(SERVER_WHITELIST_FILE, 'server whitelist')
-    webhook_users = IdWhitelist(WEBHOOK_USERS_FILE, 'webhook user list')
+    whitelists = Whitelists(WHITELIST_FILE)
     log.info('blacklist loaded from %s: %s', BLACKLIST_FILE.name, blacklist.info())
-    if not server_whitelist.ids:
+    if not whitelists.servers:
         log.warning('server whitelist is empty: no servers will be monitored')
+    if not whitelists.users:
+        log.warning('user whitelist is empty: no messages will be checked or deleted')
     if WEBHOOK_ENABLED:
         log.info('webhook re-posting enabled')
-        if not WEBHOOK_USERS_FILE.exists():
-            log.warning('webhook user list not found at %s; no messages will be re-posted',
-                        WEBHOOK_USERS_FILE)
-        elif not webhook_users.ids:
-            log.warning('webhook user list is empty: no messages will be re-posted')
-        unlisted = webhook_users.ids - whitelist.ids
-        if unlisted:
-            log.warning('%d webhook user(s) are not in the user whitelist and will never '
-                        'be forwarded', len(unlisted))
+        if not whitelists.webhook_users:
+            log.warning('no users have "webhook": true, so nothing will be re-posted')
 
     # Memory-lean client for a 1 GB host: no message cache, no member cache,
     # no startup chunking. Guild subscriptions stay on so messages from large
     # servers still arrive.
     client = AntiReportClient(
         blacklist,
-        whitelist,
-        server_whitelist,
-        webhook_users,
+        whitelists,
         blacklist_path=BLACKLIST_FILE,
         match_mode=MATCH_MODE,
         max_messages=None,

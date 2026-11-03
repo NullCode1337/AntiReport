@@ -44,39 +44,58 @@ DISCORD_TOKEN=your_token_here
 Alternatively, leave `DISCORD_TOKEN` empty and write the token to `token.txt`.
 A real environment variable (`export DISCORD_TOKEN=...`) overrides `.env`.
 
-3. List the servers (guilds) to monitor in `whitelist_servers.txt`, one ID per
-   line. Messages from any other server are ignored; an empty list monitors
-   nothing.
+3. Configure `whitelist.json`. Servers listed in `servers` are the only ones
+   monitored; only authors listed in `users` are checked. Both lists are
+   required — an empty list matches nothing. A user entry is either a bare ID
+   or an object with an optional `webhook` flag (default `false`):
 
-```text
-123456789012345678
-234567890123456789
+```json
+{
+  "users": [
+    345678901234567890,
+    {"id": 456789012345678901, "webhook": true}
+  ],
+  "servers": [123456789012345678, 234567890123456789]
+}
 ```
 
-4. Add the user IDs whose messages should be checked to `whitelist_users.txt`,
-   one per line:
+   `"webhook": true` opts that user into webhook re-posting (see step 5);
+   leave it off if you do not use the webhook.
 
-```text
-345678901234567890
-456789012345678901
-```
-
-5. Edit `blacklist_words.txt` if needed, one term per line. Other settings in
+4. Edit `blacklist_words.txt` if needed, one term per line. Other settings in
    `.env` (`MATCH_MODE`, workers, queue size, logging) are documented in
    `.env.example`.
 
-6. Optional: to re-post deleted messages into a channel, create a webhook in
+5. Optional: to re-post deleted messages into a channel, create a webhook in
    that channel and add it to `.env`:
 
    ```ini
    WEBHOOK_ENABLED=true
    WEBHOOK_URL=https://discord.com/api/webhooks/123456789012345678/your-token
-   WEBHOOK_USERS_FILE=webhook_users.txt
    ```
 
-   Then list the user IDs whose messages should be re-posted in
-   `webhook_users.txt`, one per line. Only those users are forwarded; an empty
-   list re-posts nothing.
+   Then set `"webhook": true` on the `users` entries whose deleted messages
+   should be re-posted:
+
+   ```json
+   {
+     "users": [
+       {"id": 345678901234567890, "webhook": true},
+       456789012345678901
+     ],
+     "servers": [123456789012345678]
+   }
+   ```
+
+   Only users with the flag are forwarded; with no `true` entry nothing is
+   re-posted.
+
+   Image attachments on a forwarded message are downloaded into memory and
+   re-uploaded with the webhook post (multipart/form-data), so the deleted
+   image is preserved too. Limits default to 4 images per message and 8 MB per
+   image; adjust `WEBHOOK_MAX_IMAGES` and `WEBHOOK_MAX_IMAGE_MB` in `.env`.
+   Oversized, non-image, or unreachable attachments are skipped and the text is
+   still re-posted.
 
 ## Run
 
@@ -93,8 +112,8 @@ logged in as <name> (<id>), <n> guild(s)
 
 Stop with `Ctrl+C`.
 
-The whitelist, server whitelist, and blacklist files are re-read automatically
-when they change; no restart is needed after editing them.
+`whitelist.json` and `blacklist_words.txt` are re-read automatically when they
+change; no restart is needed after editing them.
 
 ## Run as a service (systemd)
 
@@ -146,9 +165,15 @@ sudo systemctl restart antireport
   delete in that channel; grant the permission or remove the channel from use.
 - `blacklist not found: ...`: check `BLACKLIST_FILE` in `.env`.
 - `server whitelist is empty: no servers will be monitored`: add guild IDs to
-  `whitelist_servers.txt`.
-- `webhook user list is empty: no messages will be re-posted`: add user IDs to
-  `webhook_users.txt`.
+  the `servers` array in `whitelist.json`.
+- `user whitelist is empty: no messages will be checked or deleted`: add user
+  IDs to the `users` array in `whitelist.json`.
+- `no users have "webhook": true, so nothing will be re-posted`: add
+  `"webhook": true` to a user entry in `whitelist.json`.
+- `"webhook_users" is ignored`: the old separate list was replaced; put
+  `"webhook": true` on the user entries instead.
+- `cannot read whitelist ...`: the JSON is malformed or half-written; the
+  previous lists stay active until the file parses again.
 - `WEBHOOK_ENABLED is true but WEBHOOK_URL is empty` or
   `WEBHOOK_URL does not look like a Discord webhook URL`: fix `WEBHOOK_URL`.
 - `webhook rejected further re-posts (status 401/403/404)`: the webhook was
