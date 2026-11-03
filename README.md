@@ -103,6 +103,19 @@ A real environment variable (`export DISCORD_TOKEN=...`) overrides `.env`.
    other user pings stay suppressed. Forwarded messages are not replies and
    get no prefix.
 
+   While the webhook is enabled, the account can use `///fw` to delete its own
+   message and re-post it through the webhook in one step. As a reply whose
+   entire text is `///fw`, it deletes the replied-to message and the command and
+   re-posts the replied-to message. In any message that is not a reply, the
+   token may appear anywhere: the message is deleted, the token is trimmed out
+   of its text, and the remainder is re-posted. It works in any server, not only
+   whitelisted ones, and the author of the target does not have to be
+   whitelisted. The command is inert when the webhook is disabled; a reply whose
+   text is anything other than exactly `///fw` is ignored. If the replied-to
+   message is no longer resolvable from the event payload, it is still deleted
+   by ID but nothing is re-posted. If only the token remains after trimming, the
+   `[no text content]` placeholder is re-posted.
+
    Optionally rewrite words in the re-post with emoji. Create
    `replacements.json` mapping each emoji to one word or an array of words:
 

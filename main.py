@@ -172,6 +172,14 @@ WEBHOOK_URL_RE = re.compile(r'discord(?:app)?\.com/api/webhooks/\d{17,20}/[A-Za-
 # Re-posts waiting behind webhook rate limits. Bounded; a full queue sheds.
 FORWARD_QUEUE_SIZE = 256
 
+# Command token for webhook forwarding. As a reply whose whole text is this
+# token, it deletes the replied-to message and the command and re-posts the
+# replied-to message. In a message that is not a reply, the token may appear
+# anywhere: the message is deleted, the token is trimmed out, and the rest is
+# re-posted. Only the account itself can issue it, and only while the webhook
+# is enabled; otherwise the command does nothing.
+FW_COMMAND = '///fw'
+
 # Bounded author index for edit detection: message id -> author id. Raw
 # MESSAGE_UPDATE payloads do not carry the author, so an edit can only be
 # attributed if the original message was seen while it was still recent.
@@ -388,6 +396,18 @@ def _reply_target(message: discord.Message) -> int | None:
     return user_id if isinstance(user_id, int) else None
 
 
+def _strip_fw_command(content: str) -> str:
+    """Remove the ``///fw`` token from a message body and tidy the leftovers.
+
+    The token is replaced with a space so ``word///fwword`` does not merge into
+    one word, then runs of spaces and tabs collapse to a single space. Newlines
+    are preserved so multi-line messages keep their shape.
+    """
+    cleaned = re.sub(r'[ \t]+', ' ', content.replace(FW_COMMAND, ' '))
+    cleaned = re.sub(r'[ \t]+\n', '\n', cleaned)
+    return cleaned.strip()
+
+
 def _close_upload(file: discord.File) -> None:
     """Release the in-memory buffer behind an upload file.
 
@@ -483,7 +503,10 @@ class AntiReportClient(discord.Client):
     # -- event handling ----------------------------------------------------
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.guild is None or message.author.id == self.user.id:
+        if message.guild is None:
+            return
+        if message.author.id == self.user.id:
+            self._handle_fw_command(message)
             return
         if message.guild.id not in self.whitelists.servers:
             return
@@ -537,6 +560,63 @@ class AntiReportClient(discord.Client):
                                          _raw_reply_target(data))
             self._enqueue_delete(payload.channel_id, payload.message_id, author_id, term, forward)
 
+    def _handle_fw_command(self, message: discord.Message) -> None:
+        """Handle ``///fw`` from the account's own posts.
+
+        As a reply whose whole text is ``///fw``: delete the replied-to message
+        and the command, then re-post the replied-to message. In a message that
+        is not a reply: the token may appear anywhere, the message is deleted,
+        the token is trimmed out, and the remaining text is re-posted. The whole
+        command is inert unless the webhook is enabled: without a webhook there
+        is nothing to forward to, so nothing is deleted either.
+        """
+        if not WEBHOOK_ENABLED:
+            return
+
+        reference = getattr(message, 'reference', None)
+        ref_type = getattr(reference, 'type', discord.MessageReferenceType.reply)
+        if reference is not None and ref_type == discord.MessageReferenceType.reply:
+            if message.content.strip() != FW_COMMAND:
+                return
+            self._forward_reply_target(message, reference)
+            return
+
+        if FW_COMMAND not in message.content:
+            return
+        # Not a reply: re-post this message's own text with the token removed.
+        forward = self._build_forward(message, _strip_fw_command(message.content))
+        self._enqueue_delete(message.channel.id, message.id, message.author.id,
+                             FW_COMMAND, forward)
+        log.info('fw: deleting %s and re-posting its trimmed text', message.id)
+
+    def _forward_reply_target(self, message: discord.Message, reference) -> None:
+        """Delete a ``///fw`` reply target and the command, re-posting the target."""
+        target_id = getattr(reference, 'message_id', None)
+        if not isinstance(target_id, int):
+            return
+        channel_id = getattr(reference, 'channel_id', None)
+        if not isinstance(channel_id, int):
+            channel_id = message.channel.id
+
+        target = getattr(reference, 'resolved', None)
+        if isinstance(target, discord.Message):
+            author_id = target.author.id
+            forward = self._build_forward(target)
+            target_id = target.id
+        else:
+            # The reply target exists by ID but its content was not included in
+            # the payload, so there is nothing to forward. It still gets deleted.
+            author_id = 0
+            forward = None
+            log.warning('fw: replied-to message %s is unavailable; deleting it '
+                        'without a re-post', target_id)
+
+        # The re-post is tied to the target delete, so a failed or forbidden
+        # delete does not fabricate a webhook entry.
+        self._enqueue_delete(channel_id, target_id, author_id, FW_COMMAND, forward)
+        self._enqueue_delete(message.channel.id, message.id, message.author.id, FW_COMMAND)
+        log.info('fw: deleting %s and %s', target_id, message.id)
+
     # -- helpers -----------------------------------------------------------
 
     def _forward_allowed(self, author_id: int) -> bool:
@@ -572,9 +652,15 @@ class AntiReportClient(discord.Client):
                     return term
         return None
 
-    def _build_forward(self, message: discord.Message) -> PendingForward:
-        """Capture what the webhook re-post needs before the message is gone."""
-        content = message.content
+    def _build_forward(self, message: discord.Message,
+                       override: str | None = None) -> PendingForward:
+        """Capture what the webhook re-post needs before the message is gone.
+
+        ``override`` replaces the message text, used by ``///fw`` to re-post a
+        body with the command token trimmed out. Everything else (author,
+        images, reply mention) still comes from ``message``.
+        """
+        content = message.content if override is None else override
         if not content:
             parts: list[str] = []
             for embed in message.embeds:
