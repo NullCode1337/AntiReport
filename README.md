@@ -97,6 +97,21 @@ A real environment variable (`export DISCORD_TOKEN=...`) overrides `.env`.
    Oversized, non-image, or unreachable attachments are skipped and the text is
    still re-posted.
 
+   If the deleted message was a reply, the re-post is prefixed with the
+   mentioned user (`<@id>`) so the person it answered is visible in the
+   webhook channel. Only that one mention is allowed; everyone, roles, and
+   other user pings stay suppressed. Forwarded messages are not replies and
+   get no prefix.
+
+   Optionally rewrite words in the re-post with emoji. Create
+   `replacements.json` mapping each emoji to one word or an array of words:
+
+   Any Discord emoji form works as the key (`:shortcode:`,
+   `<:custom:123456789012345678>`, or a unicode emoji). Matching follows
+   `MATCH_MODE`. Only the webhook copy is rewritten; the message on the server
+   is never modified, and none of these words are deleted unless they are also
+   in `blacklist_words.txt`. The file is optional.
+
 ## Run
 
 ```bash
@@ -112,8 +127,8 @@ logged in as <name> (<id>), <n> guild(s)
 
 Stop with `Ctrl+C`.
 
-Both `whitelist.json` and `blacklist_words.txt` are read once at startup with
-no background file polling. Restart after editing either file
+`whitelist.json`, `blacklist_words.txt`, and `replacements.json` are read once
+at startup with no background file polling. Restart after editing any of them
 (`sudo systemctl restart antireport` under systemd).
 
 ## Run as a service (systemd)

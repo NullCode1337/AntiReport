@@ -12,6 +12,8 @@ this script (real environment wins). Variables:
     BLACKLIST_FILE      default: blacklist_words.txt
     WHITELIST_FILE      default: whitelist.json; users (with optional webhook
                         opt-in per entry) and servers
+    REPLACEMENTS_FILE   default: replacements.json; word -> emoji map applied
+                        to re-posted messages only
     MATCH_MODE          word (default) | substring
     DELETE_WORKERS      concurrent delete workers, default 2
     DELETE_QUEUE_SIZE   pending deletes before shedding, default 512
@@ -23,8 +25,15 @@ this script (real environment wins). Variables:
     LOG_FILE            optional rotating log path (stdout always logs)
     LOG_LEVEL           default INFO
 
-Relative paths in BLACKLIST_FILE/WHITELIST_FILE resolve against this script's
-directory, not the process working directory.
+Relative paths in BLACKLIST_FILE/WHITELIST_FILE/REPLACEMENTS_FILE resolve
+against this script's directory, not the process working directory.
+
+Replacements format (replacements.json): keys are the replacement text (any
+Discord emoji form, e.g. ":skull:" or "<:name:123456789012345678>"), values
+are the words replaced by it, either a string or an array:
+
+The substitution happens only in the webhook re-post, never on the server,
+and uses the same MATCH_MODE as the blacklist.
 
 Whitelist format (whitelist.json): a JSON object with two arrays —
 
@@ -39,8 +48,8 @@ Whitelist format (whitelist.json): a JSON object with two arrays —
 Only listed guilds are monitored, and only listed users are checked. A user
 entry is either a bare numeric ID or an object with "id" and an optional
 "webhook" flag (default false); "webhook": true re-posts that user's deleted
-messages to WEBHOOK_URL. Both files are read once at startup; restart the
-process after editing them.
+messages to WEBHOOK_URL. All config files are read once at startup; restart
+the process after editing them.
 """
 
 from __future__ import annotations
@@ -64,6 +73,7 @@ from typing import NamedTuple
 import discord
 
 from blacklist import Blacklist
+from replacements import Replacements
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -140,6 +150,7 @@ TOKEN_ENV = 'DISCORD_TOKEN'
 TOKEN_FILE = BASE_DIR / 'token.txt'
 BLACKLIST_FILE = _env_path('BLACKLIST_FILE', BASE_DIR / 'blacklist_words.txt')
 WHITELIST_FILE = _env_path('WHITELIST_FILE', BASE_DIR / 'whitelist.json')
+REPLACEMENTS_FILE = _env_path('REPLACEMENTS_FILE', BASE_DIR / 'replacements.json')
 MATCH_MODE = os.getenv('MATCH_MODE', 'word').strip().lower()
 DELETE_WORKERS = max(1, int(os.getenv('DELETE_WORKERS', '2')))
 DELETE_QUEUE_SIZE = max(16, int(os.getenv('DELETE_QUEUE_SIZE', '512')))
@@ -399,7 +410,7 @@ def _close_upload(file: discord.File) -> None:
 
 class AntiReportClient(discord.Client):
     def __init__(self, blacklist: Blacklist, whitelists: Whitelists,
-                 **options) -> None:
+                 replacements: Replacements | None = None, **options) -> None:
         super().__init__(**options)
         # This client only consumes MESSAGE_CREATE and MESSAGE_UPDATE. Dropping
         # the parsers for noisy unused events avoids per-event allocations;
@@ -416,6 +427,7 @@ class AntiReportClient(discord.Client):
             parsers.pop(event, None)
         self.blacklist = blacklist
         self.whitelists = whitelists
+        self.replacements = replacements
         self._delete_queue: asyncio.Queue = asyncio.Queue(maxsize=DELETE_QUEUE_SIZE)
         self._workers: list[asyncio.Task] = []
         self._author_index: dict[int, int] = {}
@@ -518,6 +530,8 @@ class AntiReportClient(discord.Client):
                 # The raw edit payload has no author name or avatar; re-post the
                 # text under the webhook's own identity. Attachments are rebuilt
                 # from the payload so images survive an edit-triggered delete.
+                if self.replacements is not None:
+                    content = self.replacements.apply(content)
                 forward = PendingForward(content, None, None,
                                          self._raw_images(data.get('attachments')),
                                          _raw_reply_target(data))
@@ -574,6 +588,10 @@ class AntiReportClient(discord.Client):
                 if attachment.filename:
                     parts.append(attachment.filename)
             content = '\n'.join(parts)
+
+        if self.replacements is not None:
+            # Only the re-post is rewritten; the stored message is untouched.
+            content = self.replacements.apply(content)
 
         author = message.author
         name = getattr(author, 'display_name', None) or str(author)
@@ -806,7 +824,13 @@ def main() -> None:
 
     blacklist = Blacklist.load(BLACKLIST_FILE, match_mode=MATCH_MODE)
     whitelists = Whitelists(WHITELIST_FILE)
+    replacements = Replacements(REPLACEMENTS_FILE, match_mode=MATCH_MODE)
     log.info('blacklist loaded from %s: %s', BLACKLIST_FILE.name, blacklist.info())
+    if replacements.count:
+        log.info('replacements loaded from %s: %d word(s)',
+                 REPLACEMENTS_FILE.name, replacements.count)
+    elif REPLACEMENTS_FILE.exists():
+        log.warning('replacements file %s has no usable entries', REPLACEMENTS_FILE)
     if not whitelists.servers:
         log.warning('server whitelist is empty: no servers will be monitored')
     if not whitelists.users:
@@ -824,6 +848,7 @@ def main() -> None:
     client = AntiReportClient(
         blacklist,
         whitelists,
+        replacements,
         max_messages=None,
         member_cache_flags=discord.MemberCacheFlags.none(),
         chunk_guilds_at_startup=False,
