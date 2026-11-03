@@ -156,7 +156,7 @@ class _Automaton:
 class Blacklist:
     """Loaded terms plus the matcher built over their normalized forms."""
 
-    __slots__ = ('terms', 'patterns', 'match_mode', 'literal_terms', '_automaton')
+    __slots__ = ('terms', 'pattern_count', 'match_mode', 'literal_terms', '_automaton')
 
     def __init__(self, terms: list[str], match_mode: str = 'word') -> None:
         if match_mode not in ('word', 'substring'):
@@ -206,7 +206,7 @@ class Blacklist:
             raise ValueError('blacklist contains no usable terms')
 
         self.terms = originals
-        self.patterns = patterns
+        self.pattern_count = len(patterns)
         self.literal_terms = literal_terms
         self._automaton = _Automaton(patterns, outputs)
 
@@ -234,7 +234,7 @@ class Blacklist:
     def info(self) -> dict[str, int]:
         return {
             'terms': len(self.terms),
-            'patterns': len(self.patterns),
+            'patterns': self.pattern_count,
             'literal_terms': len(self.literal_terms),
             'automaton_nodes': self._automaton.nodes,
         }

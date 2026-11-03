@@ -112,8 +112,9 @@ logged in as <name> (<id>), <n> guild(s)
 
 Stop with `Ctrl+C`.
 
-`whitelist.json` and `blacklist_words.txt` are re-read automatically when they
-change; no restart is needed after editing them.
+Both `whitelist.json` and `blacklist_words.txt` are read once at startup with
+no background file polling. Restart after editing either file
+(`sudo systemctl restart antireport` under systemd).
 
 ## Run as a service (systemd)
 
@@ -132,6 +133,8 @@ WorkingDirectory=/home/youruser/AntiReport
 ExecStart=/home/youruser/AntiReport/venv/bin/python /home/youruser/AntiReport/main.py
 Restart=always
 RestartSec=5
+# Optional
+Nice=10
 
 [Install]
 WantedBy=multi-user.target
@@ -172,8 +175,8 @@ sudo systemctl restart antireport
   `"webhook": true` to a user entry in `whitelist.json`.
 - `"webhook_users" is ignored`: the old separate list was replaced; put
   `"webhook": true` on the user entries instead.
-- `cannot read whitelist ...`: the JSON is malformed or half-written; the
-  previous lists stay active until the file parses again.
+- `cannot read whitelist ...`: the JSON is malformed; the whitelist is empty.
+  Fix the file and restart.
 - `WEBHOOK_ENABLED is true but WEBHOOK_URL is empty` or
   `WEBHOOK_URL does not look like a Discord webhook URL`: fix `WEBHOOK_URL`.
 - `webhook rejected further re-posts (status 401/403/404)`: the webhook was

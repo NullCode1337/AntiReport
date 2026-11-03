@@ -39,14 +39,15 @@ Whitelist format (whitelist.json): a JSON object with two arrays —
 Only listed guilds are monitored, and only listed users are checked. A user
 entry is either a bare numeric ID or an object with "id" and an optional
 "webhook" flag (default false); "webhook": true re-posts that user's deleted
-messages to WEBHOOK_URL. The whitelist and the blacklist are re-read when
-their mtime changes, so entries can be updated without a restart.
+messages to WEBHOOK_URL. Both files are read once at startup; restart the
+process after editing them.
 """
 
 from __future__ import annotations
 
 import asyncio
-import functools
+import ctypes
+import gc
 import io
 import json
 import logging
@@ -55,7 +56,7 @@ import random
 import re
 import signal
 import sys
-from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import NamedTuple
@@ -65,6 +66,24 @@ import discord
 from blacklist import Blacklist
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def _trim_allocator_arenas() -> None:
+    """Cap glibc malloc arenas before any threads exist.
+
+    Each arena reserves address space and inflates RSS on multi-threaded
+    processes (the aiohttp resolver spawns threads). Two arenas is plenty for
+    this process and cuts resident memory on the 1 GB target host.
+    """
+    if not sys.platform.startswith('linux'):
+        return
+    try:
+        ctypes.CDLL('libc.so.6').mallopt(-8, 2)  # M_ARENA_MAX
+    except OSError:
+        pass
+
+
+_trim_allocator_arenas()
 
 
 def _load_env_file(path: Path) -> None:
@@ -263,61 +282,35 @@ def _user_sets(value: object, path: Path) -> tuple[frozenset[int], frozenset[int
 
 
 class Whitelists:
-    """Users, servers, and webhook opt-ins from one JSON file, hot-reloaded."""
+    """Users, servers, and webhook opt-ins read once from one JSON file."""
 
-    __slots__ = ('path', 'users', 'servers', 'webhook_users', '_mtime')
+    __slots__ = ('users', 'servers', 'webhook_users')
 
     def __init__(self, path: Path) -> None:
-        self.path = path
         self.users: frozenset[int] = frozenset()
         self.servers: frozenset[int] = frozenset()
         self.webhook_users: frozenset[int] = frozenset()
-        self._mtime: int | None = None
-        self.reload(force=True)
-
-    def _stat_mtime(self) -> int | None:
-        try:
-            return self.path.stat().st_mtime_ns
-        except OSError:
-            return None
-
-    def reload(self, *, force: bool = False) -> bool:
-        mtime = self._stat_mtime()
-        if not force and mtime == self._mtime:
-            return False
-        self._mtime = mtime
-        if mtime is None:
-            if self.users or self.servers or self.webhook_users:
-                log.warning('whitelist file %s disappeared, keeping previous entries',
-                            self.path)
-            return False
 
         try:
-            with self.path.open('r', encoding='utf-8') as handle:
+            with path.open('r', encoding='utf-8') as handle:
                 data = json.load(handle)
         except (OSError, ValueError) as exc:
-            # ValueError covers a half-written or malformed JSON file.
-            log.error('cannot read whitelist %s: %s', self.path, exc)
-            return False
+            # ValueError covers a malformed or half-written JSON file.
+            log.error('cannot read whitelist %s: %s', path, exc)
+            return
 
         if not isinstance(data, dict):
-            log.error('whitelist %s: top level must be a JSON object', self.path)
-            return False
+            log.error('whitelist %s: top level must be a JSON object', path)
+            return
 
         if 'webhook_users' in data:
             log.warning('whitelist %s: "webhook_users" is ignored; set "webhook": true on '
-                        'the user entries instead', self.path)
+                        'the user entries instead', path)
 
-        users, webhook_users = _user_sets(data.get('users'), self.path)
-        servers = _id_set(data.get('servers'), 'servers', self.path)
-
-        changed = (users, servers, webhook_users) != (
-            self.users, self.servers, self.webhook_users)
-        self.users, self.servers, self.webhook_users = users, servers, webhook_users
-        if changed:
-            log.info('whitelist loaded: %d user(s), %d server(s), %d webhook user(s)',
-                     len(users), len(servers), len(webhook_users))
-        return changed
+        self.users, self.webhook_users = _user_sets(data.get('users'), path)
+        self.servers = _id_set(data.get('servers'), 'servers', path)
+        log.info('whitelist loaded: %d user(s), %d server(s), %d webhook user(s)',
+                 len(self.users), len(self.servers), len(self.webhook_users))
 
 
 class PendingForward(NamedTuple):
@@ -370,18 +363,27 @@ def _close_upload(file: discord.File) -> None:
 
 
 class AntiReportClient(discord.Client):
-    def __init__(self, blacklist: Blacklist, whitelists: Whitelists, *,
-                 blacklist_path: Path | None = None, match_mode: str = 'word',
+    def __init__(self, blacklist: Blacklist, whitelists: Whitelists,
                  **options) -> None:
         super().__init__(**options)
+        # This client only consumes MESSAGE_CREATE and MESSAGE_UPDATE. Dropping
+        # the parsers for noisy unused events avoids per-event allocations;
+        # PRESENCE_UPDATE in particular floods large guilds.
+        parsers = self._connection.parsers
+        for event in (
+            'PRESENCE_UPDATE', 'TYPING_START', 'MESSAGE_ACK',
+            'MESSAGE_REACTION_ADD', 'MESSAGE_REACTION_REMOVE',
+            'MESSAGE_REACTION_REMOVE_ALL', 'MESSAGE_REACTION_REMOVE_EMOJI',
+            'MESSAGE_POLL_VOTE_ADD', 'MESSAGE_POLL_VOTE_REMOVE',
+            'GUILD_MEMBER_ADD', 'GUILD_MEMBER_UPDATE', 'GUILD_MEMBER_REMOVE',
+            'GUILD_MEMBERS_CHUNK', 'VOICE_STATE_UPDATE',
+        ):
+            parsers.pop(event, None)
         self.blacklist = blacklist
         self.whitelists = whitelists
-        self._blacklist_path = blacklist_path
-        self._match_mode = match_mode
-        self._blacklist_mtime = self._stat_blacklist_mtime()
         self._delete_queue: asyncio.Queue = asyncio.Queue(maxsize=DELETE_QUEUE_SIZE)
         self._workers: list[asyncio.Task] = []
-        self._author_index: OrderedDict[int, int] = OrderedDict()
+        self._author_index: dict[int, int] = {}
         self._forbidden_channels: set[int] = set()
         self._dropped = 0
         self._forward_queue: asyncio.Queue = asyncio.Queue(maxsize=FORWARD_QUEUE_SIZE)
@@ -400,55 +402,21 @@ class AntiReportClient(discord.Client):
             self._workers.append(
                 asyncio.create_task(self._forward_worker(), name='forward-worker')
             )
-        asyncio.create_task(self._watch_files(), name='file-watcher')
 
         loop = asyncio.get_running_loop()
+        # aiohttp resolves DNS through the loop's default executor. One worker
+        # thread is enough here and avoids a pool sized to the host's CPU count.
+        try:
+            loop.set_default_executor(
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix='antireport'))
+        except RuntimeError:
+            pass
+
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(self.close()))
             except (NotImplementedError, RuntimeError):
                 pass
-
-    async def _watch_files(self) -> None:
-        """Pick up whitelist/blacklist edits without a restart."""
-        while not self.is_closed():
-            await asyncio.sleep(30)
-            try:
-                self.whitelists.reload()
-                await self._reload_blacklist()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception('file watcher error')
-
-    def _stat_blacklist_mtime(self) -> int | None:
-        if self._blacklist_path is None:
-            return None
-        try:
-            return self._blacklist_path.stat().st_mtime_ns
-        except OSError:
-            return None
-
-    async def _reload_blacklist(self) -> None:
-        path = self._blacklist_path
-        if path is None:
-            return
-        mtime = self._stat_blacklist_mtime()
-        if mtime is None or mtime == self._blacklist_mtime:
-            return
-        loop = asyncio.get_running_loop()
-        try:
-            fresh = await loop.run_in_executor(
-                None, functools.partial(Blacklist.load, path, match_mode=self._match_mode)
-            )
-        except Exception:
-            # A half-written file leaves the previous matcher in place; the
-            # next tick retries against the completed write.
-            log.exception('blacklist reload failed, keeping the previous one')
-            return
-        self._blacklist_mtime = mtime
-        self.blacklist = fresh
-        log.info('blacklist reloaded: %s', fresh.info())
 
     async def on_ready(self) -> None:
         log.info('logged in as %s (%s), %d guild(s)',
@@ -461,6 +429,9 @@ class AntiReportClient(discord.Client):
             log.warning('no users have "webhook": true, so nothing will be re-posted')
         log.info('blacklist: %s | match mode: %s',
                  self.blacklist.info(), self.blacklist.match_mode)
+        state = self._connection
+        getattr(state, '_guild_presences', {}).clear()
+        getattr(state, '_presences', {}).clear()
 
     # -- event handling ----------------------------------------------------
 
@@ -524,10 +495,12 @@ class AntiReportClient(discord.Client):
 
     def _remember(self, message_id: int, author_id: int) -> None:
         index = self._author_index
+        # A plain dict is insertion-ordered; message IDs increase, so the first
+        # key is always the oldest and evicting it is O(1).
+        index.pop(message_id, None)
         index[message_id] = author_id
-        index.move_to_end(message_id)
         if len(index) > AUTHOR_INDEX_SIZE:
-            index.popitem(last=False)
+            index.pop(next(iter(index)))
 
     def _check_extra_text(self, message: discord.Message) -> str | None:
         """Check embed text and attachment filenames when content is clean."""
@@ -754,6 +727,9 @@ class AntiReportClient(discord.Client):
     async def close(self) -> None:
         for worker in self._workers:
             worker.cancel()
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+            self._workers.clear()
         await super().close()
 
 
@@ -796,14 +772,14 @@ def main() -> None:
         if not whitelists.webhook_users:
             log.warning('no users have "webhook": true, so nothing will be re-posted')
 
+    gc.freeze()
+
     # Memory-lean client for a 1 GB host: no message cache, no member cache,
     # no startup chunking. Guild subscriptions stay on so messages from large
     # servers still arrive.
     client = AntiReportClient(
         blacklist,
         whitelists,
-        blacklist_path=BLACKLIST_FILE,
-        match_mode=MATCH_MODE,
         max_messages=None,
         member_cache_flags=discord.MemberCacheFlags.none(),
         chunk_guilds_at_startup=False,
