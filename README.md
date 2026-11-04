@@ -64,9 +64,12 @@ WEBHOOK_URL=https://discord.com/api/webhooks/123456789012345678/your-token
 
 Images are re-uploaded too, capped by `WEBHOOK_MAX_IMAGES` (4) and
 `WEBHOOK_MAX_IMAGE_MB` (8). Replies are re-posted with the answered user
-mentioned; other pings stay suppressed. While enabled, `///fw` deletes a message
-and re-posts it: as a reply it forwards the replied-to message, otherwise it
-forwards the message's own text with the token trimmed out.
+mentioned; other pings stay suppressed.
+
+While `WEBHOOK_ENABLED` is true, `///fw` acts as a manual forward. It does
+nothing when the webhook is disabled: no message is deleted and nothing is
+re-posted. The reply form works from the account itself and from users in
+`whitelist.json` (in monitored servers only).
 
 Create `replacements.json` to rewrite words in the re-post only; keys are emoji
 and values are a word or array of words. The server copy is never modified.

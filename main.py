@@ -494,6 +494,8 @@ class AntiReportClient(discord.Client):
             log.warning('whitelist is empty: no messages will be checked or deleted')
         if WEBHOOK_ENABLED and not self.whitelists.webhook_users:
             log.warning('no users have "webhook": true, so nothing will be re-posted')
+        log.info('manual forward: %s', 'available: reply with ' + FW_COMMAND
+                 if WEBHOOK_ENABLED else 'disabled: webhook is off')
         log.info('blacklist: %s | match mode: %s',
                  self.blacklist.info(), self.blacklist.match_mode)
         state = self._connection
@@ -503,10 +505,24 @@ class AntiReportClient(discord.Client):
     # -- event handling ----------------------------------------------------
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.guild is None:
-            return
+        # Trace every carrier of the token before the author filter. If a
+        # command appears to do nothing, this line distinguishes an event that
+        # never reached the client from a mismatch between the sending account
+        # and the logged-in account, which no handler-side log can show.
+        content = message.content or ''
+        if FW_COMMAND in content:
+            log.info('fw: saw %s from %s (self=%s, guild=%s): %r',
+                     message.id, message.author.id,
+                     message.author.id == self.user.id,
+                     getattr(message.guild, 'id', None), content[:80])
+
+        # The operator's own posts drive ``///fw`` and must be seen in DMs too,
+        # where ``message.guild`` is None. Authorship is checked first for that
+        # reason; everything below only applies to guild messages from others.
         if message.author.id == self.user.id:
             self._handle_fw_command(message)
+            return
+        if message.guild is None:
             return
         if message.guild.id not in self.whitelists.servers:
             return
@@ -514,6 +530,20 @@ class AntiReportClient(discord.Client):
         author_id = message.author.id
         if author_id not in self.whitelists.users:
             return
+
+        # A whitelisted sender may use the reply form of the manual forward:
+        # replying with exactly the token deletes the replied-to message and
+        # the command and re-posts the target. The non-reply form stays
+        # restricted to the account itself, so the token appearing in ordinary
+        # chat can never delete the message carrying it.
+        if content.strip() == FW_COMMAND:
+            reference = getattr(message, 'reference', None)
+            ref_type = getattr(reference, 'type', discord.MessageReferenceType.reply)
+            if reference is not None and ref_type == discord.MessageReferenceType.reply:
+                self._handle_fw_command(message)
+                return
+            log.info('fw: ignoring %s from %s: whitelisted senders may only use '
+                     'the reply form', message.id, author_id)
 
         # Only whitelisted authors need to be indexed: the index exists so
         # an edit of one of their messages can be attributed without a cache.
@@ -561,38 +591,58 @@ class AntiReportClient(discord.Client):
             self._enqueue_delete(payload.channel_id, payload.message_id, author_id, term, forward)
 
     def _handle_fw_command(self, message: discord.Message) -> None:
-        """Handle ``///fw`` from the account's own posts.
+        """Handle ``///fw`` from the account itself or a whitelisted sender.
 
         As a reply whose whole text is ``///fw``: delete the replied-to message
         and the command, then re-post the replied-to message. In a message that
         is not a reply: the token may appear anywhere, the message is deleted,
-        the token is trimmed out, and the remaining text is re-posted. The whole
-        command is inert unless the webhook is enabled: without a webhook there
-        is nothing to forward to, so nothing is deleted either.
+        the token is trimmed out, and the remaining text is re-posted. The
+        non-reply form is only reachable for the account itself; the caller
+        gates whitelisted senders to the reply form. The whole command is inert
+        unless the webhook is enabled: without a webhook there is nothing to
+        forward to, so nothing is deleted either.
         """
+        content = message.content or ''
+        if FW_COMMAND not in content:
+            # Every self-authored message arrives here. Only one carrying the
+            # token is a command attempt, so this is the only silent exit.
+            return
         if not WEBHOOK_ENABLED:
+            log.info('fw: ignoring %s: webhook is disabled', message.id)
             return
 
         reference = getattr(message, 'reference', None)
         ref_type = getattr(reference, 'type', discord.MessageReferenceType.reply)
         if reference is not None and ref_type == discord.MessageReferenceType.reply:
-            if message.content.strip() != FW_COMMAND:
+            if content.strip() != FW_COMMAND:
+                log.info('fw: ignoring reply %s: text is not exactly %s',
+                         message.id, FW_COMMAND)
                 return
             self._forward_reply_target(message, reference)
             return
 
-        if FW_COMMAND not in message.content:
-            return
         # Not a reply: re-post this message's own text with the token removed.
-        forward = self._build_forward(message, _strip_fw_command(message.content))
-        self._enqueue_delete(message.channel.id, message.id, message.author.id,
-                             FW_COMMAND, forward)
-        log.info('fw: deleting %s and re-posting its trimmed text', message.id)
+        # A bare "///fw" leaves no text, so only a message carrying attachments
+        # or embeds still produces a re-post; otherwise it is just deleted.
+        trimmed = _strip_fw_command(content)
+        if trimmed:
+            forward = self._build_forward(message, trimmed)
+        elif message.attachments or message.embeds:
+            forward = self._build_forward(message, '')
+        else:
+            forward = None
+        if self._enqueue_delete(message.channel.id, message.id, message.author.id,
+                                FW_COMMAND, forward):
+            if forward is None:
+                log.info('fw: deleting %s (no text left to re-post)', message.id)
+            else:
+                log.info('fw: deleting %s and re-posting its trimmed text', message.id)
 
     def _forward_reply_target(self, message: discord.Message, reference) -> None:
         """Delete a ``///fw`` reply target and the command, re-posting the target."""
         target_id = getattr(reference, 'message_id', None)
         if not isinstance(target_id, int):
+            log.info('fw: ignoring %s: reply reference has no message id', message.id)
             return
         channel_id = getattr(reference, 'channel_id', None)
         if not isinstance(channel_id, int):
@@ -604,18 +654,48 @@ class AntiReportClient(discord.Client):
             forward = self._build_forward(target)
             target_id = target.id
         else:
-            # The reply target exists by ID but its content was not included in
-            # the payload, so there is nothing to forward. It still gets deleted.
+            # The replied-to message exists by ID but its content was not in the
+            # payload, so there is nothing to re-post. It is still deleted when
+            # the channel allows it. A fetch is deliberately not attempted: a
+            # resolved message is present on replies in practice, and an extra
+            # API call per command is not worth covering the rare gap.
             author_id = 0
             forward = None
             log.warning('fw: replied-to message %s is unavailable; deleting it '
                         'without a re-post', target_id)
 
-        # The re-post is tied to the target delete, so a failed or forbidden
-        # delete does not fabricate a webhook entry.
-        self._enqueue_delete(channel_id, target_id, author_id, FW_COMMAND, forward)
-        self._enqueue_delete(message.channel.id, message.id, message.author.id, FW_COMMAND)
-        log.info('fw: deleting %s and %s', target_id, message.id)
+        # Only the account's own messages are deletable in a DM or group DM; in
+        # a guild, Manage Messages covers the target. Attempting a delete that
+        # cannot succeed would 403 and mark the whole channel forbidden, which
+        # would silently kill later work there.
+        own_target = isinstance(target, discord.Message) and (
+            self.user is not None and target.author.id == self.user.id)
+        deletable = message.guild is not None or own_target
+
+        if deletable:
+            # The re-post rides on the target delete, so a forbidden or dropped
+            # delete does not fabricate a webhook entry.
+            queued = self._enqueue_delete(channel_id, target_id, author_id,
+                                          FW_COMMAND, forward)
+            self._enqueue_delete(message.channel.id, message.id, message.author.id, FW_COMMAND)
+            if queued:
+                log.info('fw: deleting %s and %s', target_id, message.id)
+            return
+
+        if forward is not None:
+            # Target cannot be removed here (someone else's DM message); re-post
+            # it and delete only the command.
+            if self._enqueue_delete(message.channel.id, message.id, message.author.id,
+                                    FW_COMMAND, forward):
+                log.info('fw: deleting %s and re-posting target %s '
+                         '(target not deletable in this channel)', message.id, target_id)
+        else:
+            # The target cannot be deleted or re-posted here; still remove the
+            # command so it does not linger.
+            if self._enqueue_delete(message.channel.id, message.id, message.author.id,
+                                    FW_COMMAND):
+                log.info('fw: deleting %s (target %s not deletable and unavailable)',
+                         message.id, target_id)
 
     # -- helpers -----------------------------------------------------------
 
@@ -736,15 +816,28 @@ class AntiReportClient(discord.Client):
         return tuple(selected)
 
     def _enqueue_delete(self, channel_id: int, message_id: int, author_id: int, term: str,
-                        forward: PendingForward | None = None) -> None:
+                        forward: PendingForward | None = None) -> bool:
+        """Queue a delete and report whether it was queued rather than dropped.
+
+        Callers that attach a webhook re-post to the delete need the answer:
+        a dropped delete would otherwise log success and silently lose the
+        forward with it.
+        """
         if channel_id in self._forbidden_channels:
-            return
+            # A previous delete in this channel returned 403. Dropping the work
+            # is correct, but staying silent makes "nothing happened" look like
+            # a bug in the caller, so say why. INFO so journalctl shows it.
+            log.info('skipping delete of %s in %s: channel is marked forbidden',
+                     message_id, channel_id)
+            return False
         try:
             self._delete_queue.put_nowait((channel_id, message_id, author_id, term, forward))
         except asyncio.QueueFull:
             self._dropped += 1
             if self._dropped % 50 == 1:
                 log.warning('delete queue full, %d message(s) shed so far', self._dropped)
+            return False
+        return True
 
     async def _delete_worker(self, worker_id: int) -> None:
         while True:
