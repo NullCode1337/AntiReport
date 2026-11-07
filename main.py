@@ -172,13 +172,18 @@ WEBHOOK_URL_RE = re.compile(r'discord(?:app)?\.com/api/webhooks/\d{17,20}/[A-Za-
 # Re-posts waiting behind webhook rate limits. Bounded; a full queue sheds.
 FORWARD_QUEUE_SIZE = 256
 
+# Message IDs whose re-post was already queued. A message can arrive both as
+# MESSAGE_CREATE and as an embed-only MESSAGE_UPDATE (link unfurls, GIFs); the
+# second delete hits NotFound and would otherwise send a duplicate re-post.
+FORWARDED_ID_SIZE = 1024
+
 # Command token for webhook forwarding. As a reply whose whole text is this
 # token, it deletes the replied-to message and the command and re-posts the
 # replied-to message. In a message that is not a reply, the token may appear
 # anywhere: the message is deleted, the token is trimmed out, and the rest is
 # re-posted. Only the account itself can issue it, and only while the webhook
 # is enabled; otherwise the command does nothing.
-FW_COMMAND = '///fw'
+FW_COMMAND = '...fw'
 
 # Bounded author index for edit detection: message id -> author id. Raw
 # MESSAGE_UPDATE payloads do not carry the author, so an edit can only be
@@ -397,9 +402,9 @@ def _reply_target(message: discord.Message) -> int | None:
 
 
 def _strip_fw_command(content: str) -> str:
-    """Remove the ``///fw`` token from a message body and tidy the leftovers.
+    """Remove the ``...fw`` token from a message body and tidy the leftovers.
 
-    The token is replaced with a space so ``word///fwword`` does not merge into
+    The token is replaced with a space so ``word...fwword`` does not merge into
     one word, then runs of spaces and tabs collapse to a single space. Newlines
     are preserved so multi-line messages keep their shape.
     """
@@ -455,6 +460,7 @@ class AntiReportClient(discord.Client):
         self._dropped = 0
         self._forward_queue: asyncio.Queue = asyncio.Queue(maxsize=FORWARD_QUEUE_SIZE)
         self._forward_dropped = 0
+        self._forwarded_ids: dict[int, None] = {}
         self._webhook: discord.Webhook | None = None
         self._webhook_broken = False
 
@@ -516,11 +522,11 @@ class AntiReportClient(discord.Client):
                      message.author.id == self.user.id,
                      getattr(message.guild, 'id', None), content[:80])
 
-        # The operator's own posts drive ``///fw`` and must be seen in DMs too,
+        # The operator's own posts drive ``...fw`` and must be seen in DMs too,
         # where ``message.guild`` is None. Authorship is checked first for that
         # reason; everything below only applies to guild messages from others.
         if message.author.id == self.user.id:
-            self._handle_fw_command(message)
+            await self._handle_fw_command(message)
             return
         if message.guild is None:
             return
@@ -540,7 +546,7 @@ class AntiReportClient(discord.Client):
             reference = getattr(message, 'reference', None)
             ref_type = getattr(reference, 'type', discord.MessageReferenceType.reply)
             if reference is not None and ref_type == discord.MessageReferenceType.reply:
-                self._handle_fw_command(message)
+                await self._handle_fw_command(message)
                 return
             log.info('fw: ignoring %s from %s: whitelisted senders may only use '
                      'the reply form', message.id, author_id)
@@ -590,10 +596,10 @@ class AntiReportClient(discord.Client):
                                          _raw_reply_target(data))
             self._enqueue_delete(payload.channel_id, payload.message_id, author_id, term, forward)
 
-    def _handle_fw_command(self, message: discord.Message) -> None:
-        """Handle ``///fw`` from the account itself or a whitelisted sender.
+    async def _handle_fw_command(self, message: discord.Message) -> None:
+        """Handle ``...fw`` from the account itself or a whitelisted sender.
 
-        As a reply whose whole text is ``///fw``: delete the replied-to message
+        As a reply whose whole text is ``...fw``: delete the replied-to message
         and the command, then re-post the replied-to message. In a message that
         is not a reply: the token may appear anywhere, the message is deleted,
         the token is trimmed out, and the remaining text is re-posted. The
@@ -618,11 +624,11 @@ class AntiReportClient(discord.Client):
                 log.info('fw: ignoring reply %s: text is not exactly %s',
                          message.id, FW_COMMAND)
                 return
-            self._forward_reply_target(message, reference)
+            await self._forward_reply_target(message, reference)
             return
 
         # Not a reply: re-post this message's own text with the token removed.
-        # A bare "///fw" leaves no text, so only a message carrying attachments
+        # A bare "...fw" leaves no text, so only a message carrying attachments
         # or embeds still produces a re-post; otherwise it is just deleted.
         trimmed = _strip_fw_command(content)
         if trimmed:
@@ -638,8 +644,8 @@ class AntiReportClient(discord.Client):
             else:
                 log.info('fw: deleting %s and re-posting its trimmed text', message.id)
 
-    def _forward_reply_target(self, message: discord.Message, reference) -> None:
-        """Delete a ``///fw`` reply target and the command, re-posting the target."""
+    async def _forward_reply_target(self, message: discord.Message, reference) -> None:
+        """Delete a ``...fw`` reply target and the command, re-posting the target."""
         target_id = getattr(reference, 'message_id', None)
         if not isinstance(target_id, int):
             log.info('fw: ignoring %s: reply reference has no message id', message.id)
@@ -651,7 +657,8 @@ class AntiReportClient(discord.Client):
         target = getattr(reference, 'resolved', None)
         if isinstance(target, discord.Message):
             author_id = target.author.id
-            forward = self._build_forward(target)
+            author = await self._forward_author(target)
+            forward = self._build_forward(target, author=author)
             target_id = target.id
         else:
             # The replied-to message exists by ID but its content was not in the
@@ -732,13 +739,33 @@ class AntiReportClient(discord.Client):
                     return term
         return None
 
-    def _build_forward(self, message: discord.Message,
-                       override: str | None = None) -> PendingForward:
+    async def _forward_author(self, message: discord.Message) -> object:
+        """Resolve *message*'s author to a Member so the nickname is used.
+
+        A referenced_message carries no member object, so the resolved author
+        of a reply target is a bare User and display_name falls back to the
+        global name. Fetching the member restores the per-server nickname.
+        """
+        author = message.author
+        guild = message.guild
+        if (guild is None or isinstance(author, discord.Member)
+                or message.webhook_id is not None):
+            return author
+        try:
+            return await guild.fetch_member(author.id)
+        except discord.HTTPException as exc:
+            log.warning('cannot resolve member %s for the re-post name: %s',
+                        author.id, exc)
+            return author
+
+    def _build_forward(self, message: discord.Message, override: str | None = None,
+                       author: object | None = None) -> PendingForward:
         """Capture what the webhook re-post needs before the message is gone.
 
-        ``override`` replaces the message text, used by ``///fw`` to re-post a
-        body with the command token trimmed out. Everything else (author,
-        images, reply mention) still comes from ``message``.
+        ``override`` replaces the message text, used by ``...fw`` to re-post a
+        body with the command token trimmed out. ``author`` replaces
+        ``message.author`` when the caller resolved a better identity (the
+        Member behind a reply target). Everything else comes from ``message``.
         """
         content = message.content if override is None else override
         if not content:
@@ -759,7 +786,7 @@ class AntiReportClient(discord.Client):
             # Only the re-post is rewritten; the stored message is untouched.
             content = self.replacements.apply(content)
 
-        author = message.author
+        author = message.author if author is None else author
         name = getattr(author, 'display_name', None) or str(author)
         name = name[:80]
         if 'discord' in name.lower() or 'clyde' in name.lower():
@@ -830,6 +857,11 @@ class AntiReportClient(discord.Client):
             log.info('skipping delete of %s in %s: channel is marked forbidden',
                      message_id, channel_id)
             return False
+        if forward is not None and message_id in self._forwarded_ids:
+            # The same message already carries a queued re-post (create plus
+            # embed-only update). Keep the delete, drop the second copy.
+            log.debug('skipping duplicate re-post of %s', message_id)
+            forward = None
         try:
             self._delete_queue.put_nowait((channel_id, message_id, author_id, term, forward))
         except asyncio.QueueFull:
@@ -837,6 +869,12 @@ class AntiReportClient(discord.Client):
             if self._dropped % 50 == 1:
                 log.warning('delete queue full, %d message(s) shed so far', self._dropped)
             return False
+        if forward is not None:
+            # An insertion-ordered dict makes the oldest id the first key, so
+            # eviction stays O(1).
+            self._forwarded_ids[message_id] = None
+            if len(self._forwarded_ids) > FORWARDED_ID_SIZE:
+                self._forwarded_ids.pop(next(iter(self._forwarded_ids)))
         return True
 
     async def _delete_worker(self, worker_id: int) -> None:

@@ -66,7 +66,7 @@ Images are re-uploaded too, capped by `WEBHOOK_MAX_IMAGES` (4) and
 `WEBHOOK_MAX_IMAGE_MB` (8). Replies are re-posted with the answered user
 mentioned; other pings stay suppressed.
 
-While `WEBHOOK_ENABLED` is true, `///fw` acts as a manual forward. It does
+While `WEBHOOK_ENABLED` is true, `...fw` acts as a manual forward. It does
 nothing when the webhook is disabled: no message is deleted and nothing is
 re-posted. The reply form works from the account itself and from users in
 `whitelist.json` (in monitored servers only).
