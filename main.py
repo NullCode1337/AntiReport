@@ -212,9 +212,10 @@ def _fw_pattern(prefix: str) -> re.Pattern[str]:
 FW_PREFIX = _normalize_fw(os.getenv('FW_PREFIX', '...fw')).strip() or '...fw'
 FW_PATTERN = _fw_pattern(FW_PREFIX)
 
-# Bounded author index for edit detection: message id -> author id. Raw
-# MESSAGE_UPDATE payloads do not carry the author, so an edit can only be
-# attributed if the original message was seen while it was still recent.
+# Bounded author index for edit detection: message id -> (author id, display
+# name, avatar URL). Raw MESSAGE_UPDATE payloads do not carry the author, so an
+# edit can only be attributed and re-posted under the original identity if the
+# message was seen while it was still recent.
 AUTHOR_INDEX_SIZE = max(256, int(os.getenv('AUTHOR_INDEX_SIZE', '2048')))
 
 # A hit is acted on after a short random pause so deletion and re-posting do
@@ -428,6 +429,24 @@ def _reply_target(message: discord.Message) -> int | None:
     return user_id if isinstance(user_id, int) else None
 
 
+def _webhook_identity(author: object) -> tuple[str | None, str | None]:
+    """Return the name and avatar a webhook re-post should use for *author*.
+
+    Discord rejects webhook usernames containing "discord" or "clyde", so those
+    become None and the webhook keeps its own name. A non-HTTPS avatar is
+    likewise dropped.
+    """
+    name = getattr(author, 'display_name', None) or str(author)
+    name = name[:80]
+    if 'discord' in name.lower() or 'clyde' in name.lower():
+        name = None
+
+    avatar = getattr(getattr(author, 'display_avatar', None), 'url', None)
+    if not isinstance(avatar, str) or not avatar.startswith('https://'):
+        avatar = None
+    return name, avatar
+
+
 def _strip_fw_command(content: str) -> str:
     """Remove the manual forward token from a body and tidy the leftovers.
 
@@ -484,7 +503,7 @@ class AntiReportClient(discord.Client):
         self.replacements = replacements
         self._delete_queue: asyncio.Queue = asyncio.Queue(maxsize=DELETE_QUEUE_SIZE)
         self._workers: list[asyncio.Task] = []
-        self._author_index: dict[int, int] = {}
+        self._author_index: dict[int, tuple[int, str | None, str | None]] = {}
         self._forbidden_channels: set[int] = set()
         self._dropped = 0
         self._forward_queue: asyncio.Queue = asyncio.Queue(maxsize=FORWARD_QUEUE_SIZE)
@@ -582,7 +601,7 @@ class AntiReportClient(discord.Client):
 
         # Only whitelisted authors need to be indexed: the index exists so
         # an edit of one of their messages can be attributed without a cache.
-        self._remember(message.id, author_id)
+        self._remember(message, author_id)
 
         term = self.blacklist.check(message.content)
         if term is None:
@@ -603,8 +622,11 @@ class AntiReportClient(discord.Client):
         if guild_id not in self.whitelists.servers:
             return
 
-        author_id = self._author_index.get(payload.message_id)
-        if author_id is None or author_id not in self.whitelists.users:
+        entry = self._author_index.get(payload.message_id)
+        if entry is None:
+            return
+        author_id, author_name, avatar_url = entry
+        if author_id not in self.whitelists.users:
             return
 
         content = data.get('content')
@@ -615,12 +637,14 @@ class AntiReportClient(discord.Client):
         if term is not None:
             forward = None
             if self._forward_allowed(author_id):
-                # The raw edit payload has no author name or avatar; re-post the
-                # text under the webhook's own identity. Attachments are rebuilt
-                # from the payload so images survive an edit-triggered delete.
+                # The raw edit payload carries no author, so reuse the name and
+                # avatar captured when the message first arrived; otherwise the
+                # re-post would appear under the webhook's own identity.
+                # Attachments are rebuilt from the payload so images survive an
+                # edit-triggered delete.
                 if self.replacements is not None:
                     content = self.replacements.apply(content)
-                forward = PendingForward(content, None, None,
+                forward = PendingForward(content, author_name, avatar_url,
                                          self._raw_images(data.get('attachments')),
                                          _raw_reply_target(data))
             self._enqueue_delete(payload.channel_id, payload.message_id, author_id, term, forward)
@@ -735,12 +759,13 @@ class AntiReportClient(discord.Client):
         """Only opted-in users are re-posted; the toggle gates the whole feature."""
         return WEBHOOK_ENABLED and author_id in self.whitelists.webhook_users
 
-    def _remember(self, message_id: int, author_id: int) -> None:
+    def _remember(self, message: discord.Message, author_id: int) -> None:
         index = self._author_index
+        name, avatar = _webhook_identity(message.author)
         # A plain dict is insertion-ordered; message IDs increase, so the first
         # key is always the oldest and evicting it is O(1).
-        index.pop(message_id, None)
-        index[message_id] = author_id
+        index.pop(message.id, None)
+        index[message.id] = (author_id, name, avatar)
         if len(index) > AUTHOR_INDEX_SIZE:
             index.pop(next(iter(index)))
 
@@ -812,15 +837,7 @@ class AntiReportClient(discord.Client):
             content = self.replacements.apply(content)
 
         author = message.author if author is None else author
-        name = getattr(author, 'display_name', None) or str(author)
-        name = name[:80]
-        if 'discord' in name.lower() or 'clyde' in name.lower():
-            # Discord rejects webhook usernames containing these words.
-            name = None
-
-        avatar = getattr(getattr(author, 'display_avatar', None), 'url', None)
-        if not isinstance(avatar, str) or not avatar.startswith('https://'):
-            avatar = None
+        name, avatar = _webhook_identity(author)
 
         return PendingForward(content=content[:4096] or '[no text content]',
                               author_name=name, avatar_url=avatar,
