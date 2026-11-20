@@ -22,6 +22,7 @@ this script (real environment wins). Variables:
     WEBHOOK_URL         webhook that receives the deleted messages
     WEBHOOK_MAX_IMAGES  image attachments re-posted per message, default 4
     WEBHOOK_MAX_IMAGE_MB per-image size cap for re-posting, default 8
+    FW_PREFIX           manual forward token, default: ...fw
     LOG_FILE            optional rotating log path (stdout always logs)
     LOG_LEVEL           default INFO
 
@@ -177,13 +178,39 @@ FORWARD_QUEUE_SIZE = 256
 # second delete hits NotFound and would otherwise send a duplicate re-post.
 FORWARDED_ID_SIZE = 1024
 
-# Command token for webhook forwarding. As a reply whose whole text is this
-# token, it deletes the replied-to message and the command and re-posts the
-# replied-to message. In a message that is not a reply, the token may appear
-# anywhere: the message is deleted, the token is trimmed out, and the rest is
-# re-posted. Only the account itself can issue it, and only while the webhook
-# is enabled; otherwise the command does nothing.
-FW_COMMAND = '...fw'
+# Manual forward token, configurable with FW_PREFIX. As a reply whose whole
+# text is exactly the token, it deletes the replied-to message and the command
+# and re-posts the replied-to message. In any other message containing the
+# token, the token is trimmed out and the message itself is deleted and
+# re-posted. The account itself can do this anywhere (including DMs);
+# whitelisted senders can do it in monitored servers. Only while the webhook is
+# enabled; otherwise nothing is deleted and nothing is re-posted.
+#
+# Mobile keyboards get in the way of a token made of plain periods: iOS and
+# several Android keyboards rewrite "..." as the single character "…", some
+# IMEs emit full-width periods, and autocorrect can capitalize the trailing
+# letters or insert a space after the ellipsis. The matcher below normalizes
+# those substitutions and tolerates spacing between the token's characters, so
+# a token typed on a phone behaves like one typed on a PC.
+_FW_PUNCT = str.maketrans({
+    '\u2026': '...', '\uff0e': '.', '\u00a0': ' ', '\u202f': ' ',
+})
+_FW_INVISIBLE = dict.fromkeys(map(ord, '\u200b\u200c\u200d\u2060\ufeff'), None)
+
+
+def _normalize_fw(text: str) -> str:
+    """Undo the punctuation and invisible-character substitutions of mobiles."""
+    return text.translate(_FW_PUNCT).translate(_FW_INVISIBLE)
+
+
+def _fw_pattern(prefix: str) -> re.Pattern[str]:
+    """Build a case-insensitive token pattern with optional inner whitespace."""
+    chars = [re.escape(ch) for ch in _normalize_fw(prefix) if not ch.isspace()]
+    return re.compile(r'\s*'.join(chars), re.IGNORECASE)
+
+
+FW_PREFIX = _normalize_fw(os.getenv('FW_PREFIX', '...fw')).strip() or '...fw'
+FW_PATTERN = _fw_pattern(FW_PREFIX)
 
 # Bounded author index for edit detection: message id -> author id. Raw
 # MESSAGE_UPDATE payloads do not carry the author, so an edit can only be
@@ -402,13 +429,15 @@ def _reply_target(message: discord.Message) -> int | None:
 
 
 def _strip_fw_command(content: str) -> str:
-    """Remove the ``...fw`` token from a message body and tidy the leftovers.
+    """Remove the manual forward token from a body and tidy the leftovers.
 
-    The token is replaced with a space so ``word...fwword`` does not merge into
-    one word, then runs of spaces and tabs collapse to a single space. Newlines
-    are preserved so multi-line messages keep their shape.
+    Mobile-keyboard substitutions are normalized before matching, so ``…fw``
+    and ``... Fw`` are removed just like ``...fw``. The token is replaced with a
+    space so ``word...fwword`` does not merge into one word, then runs of spaces
+    and tabs collapse to a single space. Newlines are preserved so multi-line
+    messages keep their shape.
     """
-    cleaned = re.sub(r'[ \t]+', ' ', content.replace(FW_COMMAND, ' '))
+    cleaned = re.sub(r'[ \t]+', ' ', FW_PATTERN.sub(' ', _normalize_fw(content)))
     cleaned = re.sub(r'[ \t]+\n', '\n', cleaned)
     return cleaned.strip()
 
@@ -500,7 +529,7 @@ class AntiReportClient(discord.Client):
             log.warning('whitelist is empty: no messages will be checked or deleted')
         if WEBHOOK_ENABLED and not self.whitelists.webhook_users:
             log.warning('no users have "webhook": true, so nothing will be re-posted')
-        log.info('manual forward: %s', 'available: reply with ' + FW_COMMAND
+        log.info('manual forward: %s', 'available: reply with ' + FW_PREFIX
                  if WEBHOOK_ENABLED else 'disabled: webhook is off')
         log.info('blacklist: %s | match mode: %s',
                  self.blacklist.info(), self.blacklist.match_mode)
@@ -516,15 +545,19 @@ class AntiReportClient(discord.Client):
         # never reached the client from a mismatch between the sending account
         # and the logged-in account, which no handler-side log can show.
         content = message.content or ''
-        if FW_COMMAND in content:
+        # Normalize before matching: a phone may send "…fw" or "… Fw" where a
+        # PC sends "...fw".
+        command = _normalize_fw(content)
+        if FW_PATTERN.search(command):
             log.info('fw: saw %s from %s (self=%s, guild=%s): %r',
                      message.id, message.author.id,
                      message.author.id == self.user.id,
                      getattr(message.guild, 'id', None), content[:80])
 
-        # The operator's own posts drive ``...fw`` and must be seen in DMs too,
-        # where ``message.guild`` is None. Authorship is checked first for that
-        # reason; everything below only applies to guild messages from others.
+        # The operator's own posts drive the manual forward and must be seen in
+        # DMs too, where ``message.guild`` is None. Authorship is checked first
+        # for that reason; everything below only applies to guild messages from
+        # others.
         if message.author.id == self.user.id:
             await self._handle_fw_command(message)
             return
@@ -537,19 +570,15 @@ class AntiReportClient(discord.Client):
         if author_id not in self.whitelists.users:
             return
 
-        # A whitelisted sender may use the reply form of the manual forward:
-        # replying with exactly the token deletes the replied-to message and
-        # the command and re-posts the target. The non-reply form stays
-        # restricted to the account itself, so the token appearing in ordinary
-        # chat can never delete the message carrying it.
-        if content.strip() == FW_COMMAND:
-            reference = getattr(message, 'reference', None)
-            ref_type = getattr(reference, 'type', discord.MessageReferenceType.reply)
-            if reference is not None and ref_type == discord.MessageReferenceType.reply:
-                await self._handle_fw_command(message)
-                return
-            log.info('fw: ignoring %s from %s: whitelisted senders may only use '
-                     'the reply form', message.id, author_id)
+        # A whitelisted sender's message containing the token is a manual
+        # forward: the reply form (whole text is exactly the token) forwards the
+        # replied-to target, and any other occurrence deletes this message and
+        # re-posts it with the token trimmed out. With the webhook off the
+        # command is inert, so the message is still checked against the
+        # blacklist like any other.
+        if WEBHOOK_ENABLED and FW_PATTERN.search(command):
+            await self._handle_fw_command(message)
+            return
 
         # Only whitelisted authors need to be indexed: the index exists so
         # an edit of one of their messages can be attributed without a cache.
@@ -597,19 +626,19 @@ class AntiReportClient(discord.Client):
             self._enqueue_delete(payload.channel_id, payload.message_id, author_id, term, forward)
 
     async def _handle_fw_command(self, message: discord.Message) -> None:
-        """Handle ``...fw`` from the account itself or a whitelisted sender.
+        """Handle the manual forward token from the account or a whitelisted sender.
 
-        As a reply whose whole text is ``...fw``: delete the replied-to message
-        and the command, then re-post the replied-to message. In a message that
-        is not a reply: the token may appear anywhere, the message is deleted,
-        the token is trimmed out, and the remaining text is re-posted. The
-        non-reply form is only reachable for the account itself; the caller
-        gates whitelisted senders to the reply form. The whole command is inert
-        unless the webhook is enabled: without a webhook there is nothing to
-        forward to, so nothing is deleted either.
+        A reply whose whole text is exactly the token deletes the replied-to
+        message and the command, then re-posts the replied-to message. Any other
+        message containing the token is deleted and re-posted with the token
+        trimmed out; a bare token leaves no text, so only attachments or embeds
+        still produce a re-post. The command is inert unless the webhook is
+        enabled: without a webhook there is nowhere to re-post to, so nothing is
+        deleted either.
         """
         content = message.content or ''
-        if FW_COMMAND not in content:
+        command = _normalize_fw(content)
+        if not FW_PATTERN.search(command):
             # Every self-authored message arrives here. Only one carrying the
             # token is a command attempt, so this is the only silent exit.
             return
@@ -619,17 +648,13 @@ class AntiReportClient(discord.Client):
 
         reference = getattr(message, 'reference', None)
         ref_type = getattr(reference, 'type', discord.MessageReferenceType.reply)
-        if reference is not None and ref_type == discord.MessageReferenceType.reply:
-            if content.strip() != FW_COMMAND:
-                log.info('fw: ignoring reply %s: text is not exactly %s',
-                         message.id, FW_COMMAND)
-                return
+        if (reference is not None and ref_type == discord.MessageReferenceType.reply
+                and FW_PATTERN.fullmatch(command.strip())):
             await self._forward_reply_target(message, reference)
             return
 
-        # Not a reply: re-post this message's own text with the token removed.
-        # A bare "...fw" leaves no text, so only a message carrying attachments
-        # or embeds still produces a re-post; otherwise it is just deleted.
+        # The token appears in the message itself (or a reply carries extra
+        # text): re-post this message with the token removed.
         trimmed = _strip_fw_command(content)
         if trimmed:
             forward = self._build_forward(message, trimmed)
@@ -638,14 +663,14 @@ class AntiReportClient(discord.Client):
         else:
             forward = None
         if self._enqueue_delete(message.channel.id, message.id, message.author.id,
-                                FW_COMMAND, forward):
+                                FW_PREFIX, forward):
             if forward is None:
                 log.info('fw: deleting %s (no text left to re-post)', message.id)
             else:
                 log.info('fw: deleting %s and re-posting its trimmed text', message.id)
 
     async def _forward_reply_target(self, message: discord.Message, reference) -> None:
-        """Delete a ``...fw`` reply target and the command, re-posting the target."""
+        """Delete a manual-forward reply target and the command, re-posting the target."""
         target_id = getattr(reference, 'message_id', None)
         if not isinstance(target_id, int):
             log.info('fw: ignoring %s: reply reference has no message id', message.id)
@@ -683,8 +708,8 @@ class AntiReportClient(discord.Client):
             # The re-post rides on the target delete, so a forbidden or dropped
             # delete does not fabricate a webhook entry.
             queued = self._enqueue_delete(channel_id, target_id, author_id,
-                                          FW_COMMAND, forward)
-            self._enqueue_delete(message.channel.id, message.id, message.author.id, FW_COMMAND)
+                                          FW_PREFIX, forward)
+            self._enqueue_delete(message.channel.id, message.id, message.author.id, FW_PREFIX)
             if queued:
                 log.info('fw: deleting %s and %s', target_id, message.id)
             return
@@ -693,14 +718,14 @@ class AntiReportClient(discord.Client):
             # Target cannot be removed here (someone else's DM message); re-post
             # it and delete only the command.
             if self._enqueue_delete(message.channel.id, message.id, message.author.id,
-                                    FW_COMMAND, forward):
+                                    FW_PREFIX, forward):
                 log.info('fw: deleting %s and re-posting target %s '
                          '(target not deletable in this channel)', message.id, target_id)
         else:
             # The target cannot be deleted or re-posted here; still remove the
             # command so it does not linger.
             if self._enqueue_delete(message.channel.id, message.id, message.author.id,
-                                    FW_COMMAND):
+                                    FW_PREFIX):
                 log.info('fw: deleting %s (target %s not deletable and unavailable)',
                          message.id, target_id)
 
@@ -762,8 +787,8 @@ class AntiReportClient(discord.Client):
                        author: object | None = None) -> PendingForward:
         """Capture what the webhook re-post needs before the message is gone.
 
-        ``override`` replaces the message text, used by ``...fw`` to re-post a
-        body with the command token trimmed out. ``author`` replaces
+        ``override`` replaces the message text, used by the manual forward to
+        re-post a body with the command token trimmed out. ``author`` replaces
         ``message.author`` when the caller resolved a better identity (the
         Member behind a reply target). Everything else comes from ``message``.
         """

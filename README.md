@@ -68,8 +68,12 @@ mentioned; other pings stay suppressed.
 
 While `WEBHOOK_ENABLED` is true, `...fw` acts as a manual forward. It does
 nothing when the webhook is disabled: no message is deleted and nothing is
-re-posted. The reply form works from the account itself and from users in
-`whitelist.json` (in monitored servers only).
+re-posted. 
+The token is configurable with `FW_PREFIX` (default `...fw`), for example:
+
+```ini
+FW_PREFIX=!fw
+```
 
 Create `replacements.json` to rewrite words in the re-post only; keys are emoji
 and values are a word or array of words. The server copy is never modified.
